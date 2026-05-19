@@ -1,0 +1,10 @@
+api_config.py
+databases/
+logs/
+backup/
+backups/
+__pycache__/
+*.pyc
+*.log
+.state
+.notify

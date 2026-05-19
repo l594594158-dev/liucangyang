@@ -34,7 +34,7 @@ NOTIFY_QUEUE = f'{BASE_DIR}/databases/notify_queue.json'
 # ========== 策略参数（4年回测验证）==========
 STOP_LOSS_PCT = 1.5 / 100
 TAKE_PROFIT_PCT = 2.5 / 100
-POLL_INTERVAL = 5          # 扫描间隔（秒）
+POLL_INTERVAL = 2          # 扫描间隔（秒）
 
 # ========== 日志 ==========
 def log(msg):

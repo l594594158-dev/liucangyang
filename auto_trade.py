@@ -73,10 +73,11 @@ def notify_alert(msg):
 
 # ========== 数据获取 ==========
 def get_data():
+    """用现货K线做指标计算，合约做执行"""
     result = []
     for tf, limit in [('5m', 100), ('1h', 200), ('4h', 200), ('1d', 200)]:
         try:
-            url = f'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval={tf}&limit={limit}'
+            url = f'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={tf}&limit={limit}'
             resp = requests.get(url, timeout=5)
             klines = resp.json()
             data = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in klines]

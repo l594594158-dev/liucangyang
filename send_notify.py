@@ -4,7 +4,7 @@ import subprocess
 import json
 import sys
 
-QUEUE_FILE = '/root/btc-strategy-backup/btc-strategy-task/databases/notify_queue.json'
+QUEUE_FILE = '/root/liucangyang/databases/notify_queue.json'
 CHANNEL = 'wecom'
 TARGET = 'LiuGang'
 

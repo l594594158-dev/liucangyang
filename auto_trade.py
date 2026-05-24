@@ -33,7 +33,7 @@ trade_binance = ccxt.binance({
 })
 
 SYMBOL = 'BTC/USDT:USDT'
-QTY = 0.007
+QTY = 0.02
 LEVERAGE = 50
 BASE_DIR = '/root/liucangyang'
 STATE_FILE = f'{BASE_DIR}/databases/state.json'

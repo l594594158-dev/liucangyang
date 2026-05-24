@@ -500,6 +500,16 @@ def main():
             has_pos = bool(state.get('long_pos') or state.get('short_pos'))
             if has_pos:
                 ensure_sl_tp(state)
+            else:
+                # 无持仓时清理所有残留条件单
+                try:
+                    algos = trade_binance.fapiprivate_get_openalgoorders({'symbol': 'BTCUSDT'})
+                    for o in algos:
+                        if o.get('algoStatus') == 'NEW':
+                            trade_binance.fapiPrivateDeleteAlgoOrder({'symbol': 'BTCUSDT', 'algoId': int(o['algoId'])})
+                            log(f"🧹 清理残留挂单 {o.get('orderType')} {o.get('positionSide')}")
+                except:
+                    pass
 
             print_status(data, state)
             time.sleep(POLL_INTERVAL)

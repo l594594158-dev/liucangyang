@@ -32,7 +32,7 @@ trade_binance = ccxt.binance({
 })
 
 SYMBOL = 'BTC/USDT:USDT'
-QTY = 0.001
+QTY = 0.02
 LEVERAGE = 50
 BASE_DIR = '/root/liucangyang'
 STATE_FILE = f'{BASE_DIR}/databases/state.json'
@@ -250,12 +250,12 @@ def do_open(direction, price, reason):
         for p in positions:
             if p.get('symbol') != SYMBOL:
                 continue
-            qty = float(p.get('contracts', 0))
-            if qty <= 0:
+            existing_qty = float(p.get('contracts', 0))
+            if existing_qty <= 0:
                 continue
             side = 'LONG' if p.get('side') == 'long' else 'SHORT'
             if side == direction:
-                log(f"🛡 交易所防护 | 已有{direction}仓{qty}BTC | 拒绝开仓")
+                log(f"🛡 交易所防护 | 已有{direction}仓{existing_qty}BTC | 拒绝开仓")
                 return False
 
         # ② 市价开仓

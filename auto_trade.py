@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTC合约 趋势回调策略 v4.2
+BTC合约 趋势回调策略 v4.0
 - 全放宽 + TP2.5%/SL1.5% + 双向各1仓
 - 4年回测: 765笔/51.6%胜率/+371%/回撤12.3%
 - 2022-2026每年正收益
@@ -14,27 +14,19 @@ import json
 import os
 from datetime import datetime
 
-# ========== API 双Key架构 ==========
-from api_config import READ_API_KEY, READ_SECRET, TRADE_API_KEY, TRADE_SECRET
+# ========== API ==========
+from api_config import API_KEY, SECRET
 
-# 行情分析实例（读取权限）
-read_binance = ccxt.binance({
-    'apiKey': READ_API_KEY,
-    'secret': READ_SECRET,
-    'options': {'defaultType': 'swap'}
-})
-
-# 交易执行实例（交易权限）
-trade_binance = ccxt.binance({
-    'apiKey': TRADE_API_KEY,
-    'secret': TRADE_SECRET,
+binance = ccxt.binance({
+    'apiKey': API_KEY,
+    'secret': SECRET,
     'options': {'defaultType': 'swap'}
 })
 
 SYMBOL = 'BTC/USDT:USDT'
-QTY = 0.02
+QTY = 0.007
 LEVERAGE = 50
-BASE_DIR = '/root/liucangyang'
+BASE_DIR = '/root/btc-strategy-backup/btc-strategy-task'
 STATE_FILE = f'{BASE_DIR}/databases/state.json'
 WORK_LOG = f'{BASE_DIR}/logs/work_log.txt'
 NOTIFY_QUEUE = f'{BASE_DIR}/databases/notify_queue.json'
@@ -122,7 +114,7 @@ def calc(df):
 
     close_closed = close.iloc[closed_lv]
     sma_closed = ta.trend.SMAIndicator(close, 20).sma_indicator().iloc[closed_lv]
-    adx_closed = adx_ind.adx().iloc[closed_lv]
+    adx_closed = adx_ind.adx().iloc[closed_lv] if 'adx_ind' in dir() else 25
 
     return {
         'price': price, 'sma20': sma20, 'rsi': rsi,
@@ -155,33 +147,27 @@ def check_entry(data):
     # ③ 回调范围 ±1.0%
     in_range = sma5m * 0.99 <= price <= sma5m * 1.01
 
-    # 1️⃣ 4h方向与1d方向必须同向 (短路门控第1关)
-    if h4_bull != d1_bull:
-        dir_4h = '多' if h4_bull else '空'
-        dir_1d = '多' if d1_bull else '空'
-        return None, f"观望 | 4h{dir_4h}/1d{dir_1d}不同向"
-
-    # 2️⃣ 1h ADX > 25
+    # ④ 1h ADX > 25
     if adx1h <= 25:
         return None, f"观望 | 1hADX={adx1h:.1f}≤25"
 
-    # 3️⃣ 4h ADX < 40
+    # ⑤ 4h ADX < 40
     if adx4h >= 40:
         return None, f"观望 | 4hADX={adx4h:.1f}≥40"
 
-    # 4️⃣ 回调范围
+    # ⑥ 回调范围
     if not in_range:
         return None, f"观望 | 偏离SMA20 ±{abs(price/sma5m-1)*100:.1f}%"
 
-    # 5️⃣ 放量 ≥1.0（过滤缩量噪音）
+    # ⑦ 放量 ≥1.0（过滤缩量噪音）
     if vol_ratio < 1.0:
         return None, f"观望 | 缩量 vol={vol_ratio:.1f}x"
 
-    # 6️⃣ LONG 顺势追多
+    # LONG 顺势追多
     if h4_bull and d1_bull and rsi5m > 40:
         return ('LONG', f"【LONG顺势追多】RSI={rsi5m:.1f} ADX1h={adx1h:.1f} vol={vol_ratio:.1f}x")
 
-    # 7️⃣ SHORT 顺势摸顶
+    # SHORT 顺势摸顶
     if (not h4_bull) and (not d1_bull) and rsi5m < 60:
         return ('SHORT', f"【SHORT顺势摸顶】RSI={rsi5m:.1f} ADX1h={adx1h:.1f} vol={vol_ratio:.1f}x")
 
@@ -246,21 +232,21 @@ def manage_positions(state, price, signal, reason):
 def do_open(direction, price, reason):
     try:
         # ① 交易所级防护：查现有持仓，同方向已有则拒绝
-        positions = trade_binance.fetch_positions()
+        positions = binance.fetch_positions()
         for p in positions:
             if p.get('symbol') != SYMBOL:
                 continue
-            existing_qty = float(p.get('contracts', 0))
-            if existing_qty <= 0:
+            qty = float(p.get('contracts', 0))
+            if qty <= 0:
                 continue
             side = 'LONG' if p.get('side') == 'long' else 'SHORT'
             if side == direction:
-                log(f"🛡 交易所防护 | 已有{direction}仓{existing_qty}BTC | 拒绝开仓")
+                log(f"🛡 交易所防护 | 已有{direction}仓{qty}BTC | 拒绝开仓")
                 return False
 
         # ② 市价开仓
         open_side = 'buy' if direction == 'LONG' else 'sell'
-        order = trade_binance.create_order(SYMBOL, 'market', open_side, QTY,
+        order = binance.create_order(SYMBOL, 'market', open_side, QTY,
                                      params={'positionSide': direction})
         entry_price = order.get('average', price)
 
@@ -284,7 +270,7 @@ def do_close(direction, price, pos_data, reason):
         close_side = 'sell' if direction == 'LONG' else 'buy'
 
         # 查当前持仓数量
-        positions = trade_binance.fetch_positions()
+        positions = binance.fetch_positions()
         qty = 0
         for p in positions:
             if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0:
@@ -297,7 +283,7 @@ def do_close(direction, price, pos_data, reason):
             log(f"⚠️ 未找到{direction}持仓，可能已被平")
             return
 
-        order = trade_binance.create_order(SYMBOL, 'market', close_side, qty,
+        order = binance.create_order(SYMBOL, 'market', close_side, qty,
                                      params={'positionSide': direction})
         close_price = order.get('average', price)
 
@@ -316,10 +302,10 @@ def do_close(direction, price, pos_data, reason):
 
         # 清理挂单
         try:
-            algos = trade_binance.fapiprivate_get_openalgoorders({'symbol': 'BTCUSDT'})
+            algos = binance.fapiprivate_get_openalgoorders({'symbol': 'BTCUSDT'})
             for o in algos:
                 if o.get('algoStatus') == 'NEW' and o.get('positionSide') == direction:
-                    trade_binance.fapiPrivateDeleteAlgoOrder({'symbol': 'BTCUSDT', 'algoId': int(o['algoId'])})
+                    binance.fapiPrivateDeleteAlgoOrder({'symbol': 'BTCUSDT', 'algoId': int(o['algoId'])})
         except:
             pass
 
@@ -328,51 +314,39 @@ def do_close(direction, price, pos_data, reason):
         work_log("错误", f"平仓失败: {e}")
 
 # ========== 挂止盈止损单 ==========
-def ensure_sl_tp(state, retries=1):
-    """
-    确保止盈止损单已挂。
-    开仓后可能存在短暂延迟导致查不到持仓，重试 retries 次。
-    """
+def ensure_sl_tp(state):
     for d_key, direction in [('long_pos', 'LONG'), ('short_pos', 'SHORT')]:
         pos = state.get(d_key)
         if not pos:
             continue
 
-        # 带重试的持仓查询
+        positions = binance.fetch_positions()
         qty = 0
-        entry = pos['entry']
-        for attempt in range(retries + 1):
-            positions = trade_binance.fetch_positions()
-            for p in positions:
-                if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0:
-                    side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
-                    if side_check == direction:
-                        qty = float(p['contracts'])
-                        exchange_entry = float(p.get('entryPrice', 0))
-                        if exchange_entry > 0:
-                            entry = exchange_entry
-                        break
-            if qty > 0:
-                break
-            if attempt < retries:
-                time.sleep(1)
-                log(f"  等待持仓确认... ({attempt+1}/{retries})")
-
+        for p in positions:
+            if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0:
+                side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
+                if side_check == direction:
+                    qty = float(p['contracts'])
+                    break
         if qty == 0:
-            # state 有记录但交易所查不到，说明可能已被平，清除 ghost
-            log(f"⚠️ {direction}本地有记录但交易所无持仓，清除")
-            if direction == 'LONG':
-                state['long_pos'] = None
-            else:
-                state['short_pos'] = None
-            save_state(state)
             continue
 
         try:
-            algos = trade_binance.fapiprivate_get_openalgoorders({'symbol': 'BTCUSDT'})
+            algos = binance.fapiprivate_get_openalgoorders({'symbol': 'BTCUSDT'})
             existing = [o for o in algos if o.get('algoStatus') == 'NEW' and o.get('positionSide') == direction]
         except:
             existing = []
+
+        # 用交易所实际入场价（非信号触发价）
+        entry = pos['entry']
+        for p in positions:
+            if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0:
+                side_ck = 'LONG' if p.get('side') == 'long' else 'SHORT'
+                if side_ck == direction:
+                    exchange_entry = float(p.get('entryPrice', 0))
+                    if exchange_entry > 0:
+                        entry = exchange_entry
+                    break
 
         if direction == 'LONG':
             sl_p = round(entry * (1 - STOP_LOSS_PCT), 1)
@@ -386,7 +360,7 @@ def ensure_sl_tp(state, retries=1):
         sl_exist = any(o.get('orderType') == 'STOP_MARKET' for o in existing)
         if not sl_exist:
             try:
-                trade_binance.create_order(SYMBOL, 'STOP_MARKET', close_side, qty,
+                binance.create_order(SYMBOL, 'STOP_MARKET', close_side, qty,
                     params={'stopPrice': sl_p, 'positionSide': direction})
                 log(f"  挂SL: ${sl_p}")
             except Exception as e:
@@ -395,7 +369,7 @@ def ensure_sl_tp(state, retries=1):
         tp_exist = any(o.get('orderType') == 'TAKE_PROFIT_MARKET' for o in existing)
         if not tp_exist:
             try:
-                trade_binance.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', close_side, qty,
+                binance.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', close_side, qty,
                     params={'stopPrice': tp_p, 'positionSide': direction})
                 log(f"  挂TP: ${tp_p}")
             except Exception as e:
@@ -403,14 +377,8 @@ def ensure_sl_tp(state, retries=1):
 
 # ========== 交易所→本地同步 ==========
 def sync_state(state):
-    """
-    以交易所为准同步本地状态：
-    1. 交易所有仓但本地无记录 → 创建记录
-    2. 交易所有仓且本地有记录 → 修正入场价
-    3. 交易所无仓但本地有记录 → 清除本地
-    """
     try:
-        positions = trade_binance.fetch_positions()
+        positions = binance.fetch_positions()
     except:
         return False
 
@@ -427,26 +395,11 @@ def sync_state(state):
         exchange_entry = float(p.get('entryPrice', 0))
         if side == 'long':
             has_long = True
-            if state.get('long_pos') is None:
-                # 幽灵仓：交易所有但本地无 → 创建
-                state['long_pos'] = {
-                    'entry': exchange_entry,
-                    'signal': '从交易所恢复',
-                    'open_time': datetime.now().isoformat()
-                }
-                log(f"📌 恢复LONG仓 | {qty}BTC @ ${exchange_entry:.1f}")
-            elif exchange_entry > 0:
-                state['long_pos']['entry'] = exchange_entry
+            if state.get('long_pos') and exchange_entry > 0:
+                state['long_pos']['entry'] = exchange_entry  # 用交易所实际入场价
         elif side == 'short':
             has_short = True
-            if state.get('short_pos') is None:
-                state['short_pos'] = {
-                    'entry': exchange_entry,
-                    'signal': '从交易所恢复',
-                    'open_time': datetime.now().isoformat()
-                }
-                log(f"📌 恢复SHORT仓 | {qty}BTC @ ${exchange_entry:.1f}")
-            elif exchange_entry > 0:
+            if state.get('short_pos') and exchange_entry > 0:
                 state['short_pos']['entry'] = exchange_entry
 
     if not has_long and state.get('long_pos'):
@@ -465,16 +418,11 @@ def print_status(data, state):
     price = r5['price']; rsi = r5['rsi']; adx1h = r1['adx']; adx4h = r4['adx']
     vol = r5['vol_ratio']
 
-    # 用闭K收盘价判断方向，与 check_entry 信号逻辑一致
-    h4_close = r4.get('close_closed', price)
-    h4_sma = r4.get('sma_closed', r4['sma20'])
-    d1_close = rd.get('close_closed', price)
-    d1_sma = rd.get('sma_closed', rd['sma20'])
-    dir_4h = '📈多' if h4_close > h4_sma else '📉空'
-    dir_1d = '📈多' if d1_close > d1_sma else '📉空'
+    dir_4h = '📈多' if price > r4['sma20'] else '📉空'
+    dir_1d = '📈多' if price > rd['sma20'] else '📉空'
 
     now = datetime.now().strftime('%H:%M:%S')
-    print(f"\n╔══ BTC v4.2趋势回调 {now} ═══")
+    print(f"\n╔══ BTC v4.0趋势回调 {now} ═══")
     print(f"║ 💰 {price:>10,.0f} | RSI:{rsi:.1f} | SMA20:{r5['sma20']:.0f}")
     print(f"║ 4h{dir_4h} 1d{dir_1d} | ADX1h:{adx1h:.1f} ADX4h:{adx4h:.1f} | vol:{vol:.1f}x")
 
@@ -494,24 +442,23 @@ def print_status(data, state):
 
 # ========== 主循环 ==========
 def main():
-    log(f"🚀 BTC v4.2 趋势回调 启动 | {LEVERAGE}x | {QTY}BTC/仓")
+    log(f"🚀 BTC v4.0 趋势回调 启动 | {LEVERAGE}x | {QTY}BTC/仓")
     log(f"策略: 全放宽+TP{TAKE_PROFIT_PCT*100}%/SL{STOP_LOSS_PCT*100}%+双向各1仓")
     log(f"4年回测: 765笔/51.6%胜率/+371%/回撤12.3%")
 
-    # 设置杠杆 + 逐仓模式
+    # 设置杠杆
     try:
-        trade_binance.set_leverage(LEVERAGE, SYMBOL)
-        trade_binance.set_margin_mode('isolated', SYMBOL)
-        log(f"杠杆设置: {LEVERAGE}x | 逐仓模式")
+        binance.set_leverage(LEVERAGE, SYMBOL)
+        log(f"杠杆设置: {LEVERAGE}x")
     except Exception as e:
-        log(f"杠杆/保证金设置: {e}")
+        log(f"杠杆设置: {e}")
 
     state = load_state()
     if 'long_pos' not in state: state['long_pos'] = None
     if 'short_pos' not in state: state['short_pos'] = None
 
     sync_state(state)
-    log("📊 API Key已配置 | 现货K线分析+合约执行")
+    log("📊 请确认API Key IP白名单: 43.128.79.184")
 
     while True:
         try:
@@ -539,15 +486,7 @@ def main():
             price = data['5m']['price']
             sig, reason = check_entry(data)
 
-            # 先查交易所实际持仓做交叉验证，防止本地状态过期
-            sync_state(state)
-
             manage_positions(state, price, sig, reason)
-
-            # 重新加载 state（manage_positions 内部已 save）
-            state = load_state()
-            if 'long_pos' not in state: state['long_pos'] = None
-            if 'short_pos' not in state: state['short_pos'] = None
 
             has_pos = bool(state.get('long_pos') or state.get('short_pos'))
             if has_pos:

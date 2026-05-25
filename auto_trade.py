@@ -32,8 +32,8 @@ trade_binance = ccxt.binance({
 })
 
 SYMBOL = 'BTC/USDT:USDT'
-QTY = 0.02
-LEVERAGE = 50
+QTY = 0.05
+LEVERAGE = 20
 BASE_DIR = '/root/liucangyang'
 STATE_FILE = f'{BASE_DIR}/databases/state.json'
 WORK_LOG = f'{BASE_DIR}/logs/work_log.txt'
@@ -494,7 +494,7 @@ def print_status(data, state):
 
 # ========== 主循环 ==========
 def main():
-    log(f"🚀 BTC v4.2 趋势回调 启动 | {LEVERAGE}x | {QTY}BTC/仓")
+    log(f"🚀 BTC v4.2 趋势回调 启动 | {LEVERAGE}x逐仓 | {QTY}BTC/仓")
     log(f"策略: 全放宽+TP{TAKE_PROFIT_PCT*100}%/SL{STOP_LOSS_PCT*100}%+双向各1仓")
     log(f"4年回测: 765笔/51.6%胜率/+371%/回撤12.3%")
 

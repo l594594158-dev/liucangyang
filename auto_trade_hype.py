@@ -16,19 +16,19 @@ import os
 from datetime import datetime
 
 # ========== API 双Key架构 ==========
-from api_config import READ_API_KEY, READ_SECRET, TRADE_API_KEY, TRADE_SECRET
+from api_config import API_KEY, SECRET
 
 # 行情分析实例（读取权限）
 read_binance = ccxt.binance({
-    'apiKey': READ_API_KEY,
-    'secret': READ_SECRET,
+    'apiKey': API_KEY,
+    'secret': SECRET,
     'options': {'defaultType': 'swap'}
 })
 
 # 交易执行实例（交易权限）
 trade_binance = ccxt.binance({
-    'apiKey': TRADE_API_KEY,
-    'secret': TRADE_SECRET,
+    'apiKey': API_KEY,
+    'secret': SECRET,
     'options': {'defaultType': 'swap'}
 })
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BTC合约任务自检脚本 v4.2
-- 适配liucangyang v4.2策略（long_pos/short_pos格式 + 7条件门控信号）
+BTC合约任务自检脚本 v4.3
+- 适配liucangyang v4.3策略（long_pos/short_pos格式 + 6条件门控信号）
 - 每5分钟执行一次自动检查
 - 检查进程运行、API数据、持仓同步、策略状态
 - 发现问题自动修复（重启进程/清幽灵仓）
@@ -116,9 +116,9 @@ class HealthChecker:
             self.add_fail('进程状态', f'检查失败: {e}')
             return False
 
-    # ========== 检查2: API数据 + v4.2信号 ==========
+    # ========== 检查2: API数据 + v4.3信号 ==========
     def check_api_data(self):
-        """检查API数据获取 + v4.2 7条件门控信号状态"""
+        """检查API数据获取 + v4.3 6条件门控信号状态"""
         try:
             # 用现货K线（与auto_trade.py一致）
             result = []
@@ -138,7 +138,7 @@ class HealthChecker:
                     self.add_fail(f'API-{name}', '最新K线收盘价为0/None', fix='retry')
                     return False
 
-            # ===== 计算指标（与v4.2 calc()一致，用闭K） =====
+            # ===== 计算指标（与v4.3 calc()一致，用闭K） =====
             def calc_v4(df_data):
                 df = pd.DataFrame(df_data, columns=['t','o','h','l','c','v'])
                 close = df['c']; high = df['h']; low = df['l']; volume = df['v']
@@ -190,57 +190,57 @@ class HealthChecker:
             d1_bull = d1_close > sma1d
 
             # SMA20 ±1%回调范围
-            in_range = sma5m * 0.99 <= price <= sma5m * 1.01
-
-            # ===== v4.2 7条件门控逐级判断 =====
+            # ===== v4.3 6条件门控逐级判断 =====
             gate = []
             # 第1关：方向同向
             if h4_bull == d1_bull:
-                gate.append(f'✅ 1/7 方向同向')
+                gate.append(f'✅ 1/6 方向同向')
             else:
-                gate.append(f'❌ 1/7 4h{"多" if h4_bull else "空"}/1d{"多" if d1_bull else "空"}不同向')
-            # 第2关：1h ADX > 25
-            if adx1h > 25:
-                gate.append(f'✅ 2/7 1hADX={adx1h:.1f}>25')
+                gate.append(f'❌ 1/6 4h{"多" if h4_bull else "空"}/1d{"多" if d1_bull else "空"}不同向')
+            # 第2关：1h ADX > 20
+            if adx1h > 20:
+                gate.append(f'✅ 2/6 1hADX={adx1h:.1f}>20')
             else:
-                gate.append(f'❌ 2/7 1hADX={adx1h:.1f}≤25')
-            # 第3关：4h ADX < 40
-            if adx4h < 40:
-                gate.append(f'✅ 3/7 4hADX={adx4h:.1f}<40')
+                gate.append(f'❌ 2/6 1hADX={adx1h:.1f}≤20')
+            # 第3关：4h ADX < 55
+            if adx4h < 55:
+                gate.append(f'✅ 3/6 4hADX={adx4h:.1f}<55')
             else:
-                gate.append(f'❌ 3/7 4hADX={adx4h:.1f}≥40')
-            # 第4关：SMA20 ±1%
+                gate.append(f'❌ 3/6 4hADX={adx4h:.1f}≥55')
+            # 第4关：SMA20 ±1.5%
+            in_range = sma5m * 0.985 <= price <= sma5m * 1.015
             if in_range:
-                gate.append(f'✅ 4/7 SMA20±1%内')
+                gate.append(f'✅ 4/6 SMA20±1.5%内')
             else:
-                gate.append(f'❌ 4/7 偏离{abs(price/sma5m-1)*100:.1f}%')
+                gate.append(f'❌ 4/6 偏离{abs(price/sma5m-1)*100:.1f}%')
             # 第5关：放量≥1.0
             if vol_ratio >= 1.0:
-                gate.append(f'✅ 5/7 vol={vol_ratio:.1f}x≥1.0')
+                gate.append(f'✅ 5/6 vol={vol_ratio:.1f}x≥1.0')
             else:
-                gate.append(f'❌ 5/7 缩量vol={vol_ratio:.1f}x')
-            # 第6关：LONG条件
-            if h4_bull and d1_bull and rsi5m > 40:
-                gate.append(f'✅ 6/7 LONG | RSI={rsi5m:.1f}>40')
-            else:
-                gate.append(f'❌ 6/7 LONG不满足')
-            # 第7关：SHORT条件
-            if (not h4_bull) and (not d1_bull) and rsi5m < 60:
-                gate.append(f'✅ 7/7 SHORT | RSI={rsi5m:.1f}<60')
-            else:
-                gate.append(f'❌ 7/7 SHORT不满足')
+                gate.append(f'❌ 5/6 缩量vol={vol_ratio:.1f}x')
+            # 第6关：RSI门控（LONG/Short按方向自动判断）
+            if h4_bull and d1_bull:
+                if rsi5m > 40:
+                    gate.append(f'✅ 6/6 RSI={rsi5m:.1f}>40 → LONG')
+                else:
+                    gate.append(f'❌ 6/6 RSI={rsi5m:.1f}≤40 → LONG不触发')
+            elif (not h4_bull) and (not d1_bull):
+                if rsi5m < 60:
+                    gate.append(f'✅ 6/6 RSI={rsi5m:.1f}<60 → SHORT')
+                else:
+                    gate.append(f'❌ 6/6 RSI={rsi5m:.1f}≥60 → SHORT不触发')
 
             # 决定最终状态
             all_pass = all('✅' in g for g in gate)
             if all_pass:
                 dir_str = '多' if h4_bull else '空'
                 sig_str = f'LONG(RSI>{rsi5m:.1f})' if (h4_bull and d1_bull) else f'SHORT(RSI<{rsi5m:.1f})'
-                self.add_ok('API数据', f'各周期正常 | ${price:,.0f} | 7条件全通→{sig_str}')
+                self.add_ok('API数据', f'各周期正常 | ${price:,.0f} | 6条件全通→{sig_str}')
             else:
                 fail_count = sum(1 for g in gate if '❌' in g)
-                self.add_ok('API数据', f'各周期正常 | ${price:,.0f} | 7条件中{fail_count}项未通过')
+                self.add_ok('API数据', f'各周期正常 | ${price:,.0f} | 6条件中{fail_count}项未通过')
 
-            self.add_ok('7条件门控', ' | '.join(gate[:5]))
+            self.add_ok('6条件门控', ' | '.join(gate[:6]))
             self.add_ok('趋势状态', f'4h:{"📈多" if h4_bull else "📉空"} | 1d:{"📈多" if d1_bull else "📉空"} | ADX1h={adx1h:.1f} ADX4h={adx4h:.1f} vol={vol_ratio:.1f}x')
             return True
 
@@ -457,7 +457,7 @@ class HealthChecker:
 
     def run(self):
         log('=' * 60)
-        log('🔍 BTC自检 v4.2 开始')
+        log('🔍 BTC自检 v4.3 开始')
         log('=' * 60)
 
         self._fixes_to_apply = []

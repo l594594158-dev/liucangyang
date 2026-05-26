@@ -222,10 +222,12 @@ def manage_positions(state, price, signal, reason):
             state['short_pos'] = None
             closed = True
 
-    # ── 新信号（双向各1仓，同方向跳过）──
+    # ── 新信号（仓位安全锁: HYPE≥5 跳过）──
     if signal == 'LONG':
         if state.get('long_pos') is not None:
             log(f"⏭ LONG信号跳过 | 已有LONG仓")
+        elif get_exchange_qty('LONG') >= QTY:
+            log(f"⏭ LONG信号跳过 | 交易所已有≥{QTY}HYPE")
         else:
             entry_price = do_open('LONG', price, reason)
             if entry_price:
@@ -233,6 +235,8 @@ def manage_positions(state, price, signal, reason):
     elif signal == 'SHORT':
         if state.get('short_pos') is not None:
             log(f"⏭ SHORT信号跳过 | 已有SHORT仓")
+        elif get_exchange_qty('SHORT') >= QTY:
+            log(f"⏭ SHORT信号跳过 | 交易所已有≥{QTY}HYPE")
         else:
             entry_price = do_open('SHORT', price, reason)
             if entry_price:
@@ -242,6 +246,19 @@ def manage_positions(state, price, signal, reason):
     return closed
 
 # ========== 开仓执行 ==========
+def get_exchange_qty(direction):
+    """查交易所同方向持仓量"""
+    try:
+        positions = trade_binance.fetch_positions([SYMBOL])
+        for p in positions:
+            if float(p.get('contracts', 0)) > 0:
+                side = 'LONG' if p.get('side') == 'long' else 'SHORT'
+                if side == direction:
+                    return float(p['contracts'])
+    except Exception as e:
+        log(f"⚠️ 查询持仓失败: {e}")
+    return 0
+
 def do_open(direction, price, reason):
     try:
         # ① 交易所级防护：查现有持仓，同方向已有则拒绝

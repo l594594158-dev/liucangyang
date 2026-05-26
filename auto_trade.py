@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-BTC合约 趋势回调策略 v4.0
-- 全放宽 + TP2.5%/SL1.5% + 双向各1仓
-- 4年回测: 765笔/51.6%胜率/+371%/回撤12.3%
-- 2022-2026每年正收益
+BTC合约 趋势回调策略 v5.0
+- 4h单周期方向 + 6指标 + TP1.2%/SL1.0% + 双向各1仓
+- 变更: 去掉1d确认, ADX放宽(1h>20/4h<55), SMA20±1.5%, 止盈止损收窄
 """
 import ccxt
 import requests
@@ -41,8 +40,8 @@ WORK_LOG = f'{BASE_DIR}/logs/work_log.txt'
 NOTIFY_QUEUE = f'{BASE_DIR}/databases/notify_queue.json'
 
 # ========== 策略参数（4年回测验证）==========
-STOP_LOSS_PCT = 1.5 / 100
-TAKE_PROFIT_PCT = 2.5 / 100
+STOP_LOSS_PCT = 1.0 / 100
+TAKE_PROFIT_PCT = 1.2 / 100
 POLL_INTERVAL = 2          # 扫描间隔（秒）
 
 # ========== 日志 ==========
@@ -84,7 +83,7 @@ def notify_alert(msg):
 def get_data():
     """用现货K线做指标计算，合约做执行"""
     result = []
-    for tf, limit in [('5m', 100), ('1h', 200), ('4h', 200), ('1d', 200)]:
+    for tf, limit in [('5m', 100), ('1h', 200), ('4h', 200)]:
         try:
             url = f'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={tf}&limit={limit}'
             resp = requests.get(url, timeout=5)
@@ -133,9 +132,9 @@ def calc(df):
         'adx_closed': adx_closed
     }
 
-# ========== 信号判断（全放宽7条件）==========
+# ========== 信号判断（v5.0: 6指标）==========
 def check_entry(data):
-    r5 = data['5m']; r1 = data['1h']; r4 = data['4h']; rd = data['1d']
+    r5 = data['5m']; r1 = data['1h']; r4 = data['4h']
 
     price = r5['price']
     rsi5m = r5['rsi']
@@ -144,45 +143,37 @@ def check_entry(data):
     vol_ratio = r5['vol_ratio']
     sma5m = r5['sma20']
 
-    # ① 4h方向 (闭K收盘价 vs 闭K SMA20 → 同回测+603%版)
+    # ① 4h方向 (闭K收盘价 vs 闭K SMA20)
     h4_close = r4.get('close_closed', r4['price'])
     sma4h = r4.get('sma_closed', r4['sma20'])
     h4_bull = h4_close > sma4h
-    # ② 1d方向 (闭K收盘价 vs 闭K SMA20)
-    d1_close = rd.get('close_closed', rd['price'])
-    sma1d = rd.get('sma_closed', rd['sma20'])
-    d1_bull = d1_close > sma1d
 
-    # ③ 回调范围 ±1.0%
-    in_range = sma5m * 0.99 <= price <= sma5m * 1.01
+    # ② 1h ADX > 20 （滤横盘）
+    if adx1h <= 20:
+        return None, f"观望 | 1hADX={adx1h:.1f}≤20"
 
-    # ④ 1h ADX > 25
-    if adx1h <= 25:
-        return None, f"观望 | 1hADX={adx1h:.1f}≤25"
+    # ③ 4h ADX < 55 （防追末端过热）
+    if adx4h >= 55:
+        return None, f"观望 | 4hADX={adx4h:.1f}≥55"
 
-    # ⑤ 4h ADX < 40
-    if adx4h >= 40:
-        return None, f"观望 | 4hADX={adx4h:.1f}≥40"
-
-    # ⑥ 回调范围
+    # ④ 回调范围 ±1.5%
+    in_range = sma5m * 0.985 <= price <= sma5m * 1.015
     if not in_range:
-        return None, f"观望 | 偏离SMA20 ±{abs(price/sma5m-1)*100:.1f}%"
+        return None, f"观望 | 偏离SMA20 ±{abs(price/sma5m-1)*100:.2f}%"
 
-    # ⑦ 放量 ≥1.0（过滤缩量噪音）
+    # ⑤ 5m量比 ≥ 1.0
     if vol_ratio < 1.0:
         return None, f"观望 | 缩量 vol={vol_ratio:.1f}x"
 
-    # LONG 顺势追多
-    if h4_bull and d1_bull and rsi5m > 40:
-        return ('LONG', f"【LONG顺势追多】RSI={rsi5m:.1f} ADX1h={adx1h:.1f} vol={vol_ratio:.1f}x")
+    # ⑥ RSI门控: LONG需>40 / SHORT需<60
+    if h4_bull and rsi5m > 40:
+        return ('LONG', f"【LONG】RSI={rsi5m:.1f} ADX1h={adx1h:.1f} vol={vol_ratio:.1f}x")
 
-    # SHORT 顺势摸顶
-    if (not h4_bull) and (not d1_bull) and rsi5m < 60:
-        return ('SHORT', f"【SHORT顺势摸顶】RSI={rsi5m:.1f} ADX1h={adx1h:.1f} vol={vol_ratio:.1f}x")
+    if (not h4_bull) and rsi5m < 60:
+        return ('SHORT', f"【SHORT】RSI={rsi5m:.1f} ADX1h={adx1h:.1f} vol={vol_ratio:.1f}x")
 
     dir_4h = '多' if h4_bull else '空'
-    dir_1d = '多' if d1_bull else '空'
-    return None, f"观望 | 4h{dir_4h}/1d{dir_1d} RSI={rsi5m:.1f} ADX1h={adx1h:.1f}"
+    return None, f"观望 | 4h{dir_4h} RSI={rsi5m:.1f} ADX1h={adx1h:.1f}"
 
 # ========== 双向各1仓管理 ==========
 def manage_positions(state, price, signal, reason):
@@ -423,17 +414,16 @@ def sync_state(state):
 
 # ========== 状态显示 ==========
 def print_status(data, state):
-    r5 = data['5m']; r4 = data['4h']; rd = data['1d']; r1 = data['1h']
+    r5 = data['5m']; r4 = data['4h']; r1 = data['1h']
     price = r5['price']; rsi = r5['rsi']; adx1h = r1['adx']; adx4h = r4['adx']
     vol = r5['vol_ratio']
 
     dir_4h = '📈多' if price > r4['sma20'] else '📉空'
-    dir_1d = '📈多' if price > rd['sma20'] else '📉空'
 
     now = datetime.now().strftime('%H:%M:%S')
-    print(f"\n╔══ BTC v4.0趋势回调 {now} ═══")
+    print(f"\n╔══ BTC v5.0 {now} ═══")
     print(f"║ 💰 {price:>10,.0f} | RSI:{rsi:.1f} | SMA20:{r5['sma20']:.0f}")
-    print(f"║ 4h{dir_4h} 1d{dir_1d} | ADX1h:{adx1h:.1f} ADX4h:{adx4h:.1f} | vol:{vol:.1f}x")
+    print(f"║ 4h{dir_4h} | ADX1h:{adx1h:.1f} ADX4h:{adx4h:.1f} | vol:{vol:.1f}x")
 
     lp = state.get('long_pos')
     sp = state.get('short_pos')
@@ -451,9 +441,8 @@ def print_status(data, state):
 
 # ========== 主循环 ==========
 def main():
-    log(f"🚀 BTC v4.0 趋势回调 启动 | {LEVERAGE}x | {QTY}BTC/仓")
-    log(f"策略: 全放宽+TP{TAKE_PROFIT_PCT*100}%/SL{STOP_LOSS_PCT*100}%+双向各1仓")
-    log(f"4年回测: 765笔/51.6%胜率/+371%/回撤12.3%")
+    log(f"🚀 BTC v5.0 启动 | {LEVERAGE}x | {QTY}BTC/仓")
+    log(f"策略: 4h方向+6指标+TP{TAKE_PROFIT_PCT*100}%/SL{STOP_LOSS_PCT*100}%+双向各1仓")
 
     # 设置杠杆
     try:
@@ -471,7 +460,7 @@ def main():
 
     while True:
         try:
-            k5m, k1h, k4h, k1d = get_data()
+            k5m, k1h, k4h = get_data()
             if not k5m:
                 time.sleep(POLL_INTERVAL)
                 continue
@@ -479,13 +468,11 @@ def main():
             df5m = pd.DataFrame(k5m, columns=['t','o','h','l','c','v'])
             df1h = pd.DataFrame(k1h, columns=['t','o','h','l','c','v'])
             df4h = pd.DataFrame(k4h, columns=['t','o','h','l','c','v'])
-            df1d = pd.DataFrame(k1d, columns=['t','o','h','l','c','v'])
 
             data = {
                 '5m': calc(df5m),
                 '1h': calc(df1h),
-                '4h': calc(df4h),
-                '1d': calc(df1d)
+                '4h': calc(df4h)
             }
 
             state = load_state()

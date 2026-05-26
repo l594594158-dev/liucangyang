@@ -255,7 +255,7 @@ def manage_positions(state, price, signal, reason):
 # ========== 开仓执行（交易所级单方向单仓保护） ==========
 def do_open(direction, price, reason):
     try:
-        # ① 交易所级防护：查现有持仓，同方向已有则拒绝
+        # ① 仓位安全锁：查现有持仓，同方向 ≥ QTY 则跳过信号
         positions = trade_binance.fetch_positions()
         for p in positions:
             if p.get('symbol') != SYMBOL:
@@ -264,8 +264,8 @@ def do_open(direction, price, reason):
             if existing_qty <= 0:
                 continue
             side = 'LONG' if p.get('side') == 'long' else 'SHORT'
-            if side == direction:
-                log(f"🛡 交易所防护 | 已有{direction}仓{existing_qty}BTC | 拒绝开仓")
+            if side == direction and existing_qty >= QTY:
+                log(f"🛡 仓位安全锁 | 已有{direction}仓{existing_qty}BTC≥{QTY}BTC | 跳过信号")
                 return False
 
         # ② 市价开仓

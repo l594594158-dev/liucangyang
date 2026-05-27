@@ -209,13 +209,27 @@ def manage_positions(state, price, signal, reason):
             state['short_pos'] = None
             closed = True
 
-    # ── 新信号（仓位安全锁: BTC≥0.02 / HYPE≥5 跳过）──
+    # ── 新信号（多空互斥：先平反方向再开同方向）──
     if signal == 'LONG':
         if state.get('long_pos') is not None:
             log(f"⏭ LONG信号跳过 | 已有LONG仓")
         elif get_exchange_qty('LONG') >= QTY:
             log(f"⏭ LONG信号跳过 | 交易所已有≥{QTY}BTC")
         else:
+            # 多空互斥：先平SHORT
+            if state.get('short_pos'):
+                pnl = (state['short_pos']['entry'] - price) / state['short_pos']['entry']
+                log(f"🔀 多空互斥 | 平SHORT开LONG | SHORT盈亏:{pnl*100:+.2f}%")
+                do_close('SHORT', price, state['short_pos'], '方向翻转')
+                state['short_pos'] = None
+            elif get_exchange_qty('SHORT') > 0:
+                log(f"🔀 多空互斥 | 交易所SHORT残留，平仓")
+                # 市价平掉交易所侧SHORT
+                positions = trade_binance.fetch_positions()
+                for p in positions:
+                    if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0 and p.get('side') == 'short':
+                        trade_binance.create_order(SYMBOL, 'market', 'buy', float(p['contracts']), params={'positionSide': 'SHORT'})
+                        break
             entry_price = do_open('LONG', price, reason)
             if entry_price:
                 state['long_pos'] = {'entry': entry_price, 'signal': reason, 'open_time': datetime.now().isoformat()}
@@ -225,6 +239,19 @@ def manage_positions(state, price, signal, reason):
         elif get_exchange_qty('SHORT') >= QTY:
             log(f"⏭ SHORT信号跳过 | 交易所已有≥{QTY}BTC")
         else:
+            # 多空互斥：先平LONG
+            if state.get('long_pos'):
+                pnl = (price - state['long_pos']['entry']) / state['long_pos']['entry']
+                log(f"🔀 多空互斥 | 平LONG开SHORT | LONG盈亏:{pnl*100:+.2f}%")
+                do_close('LONG', price, state['long_pos'], '方向翻转')
+                state['long_pos'] = None
+            elif get_exchange_qty('LONG') > 0:
+                log(f"🔀 多空互斥 | 交易所LONG残留，平仓")
+                positions = trade_binance.fetch_positions()
+                for p in positions:
+                    if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0 and p.get('side') == 'long':
+                        trade_binance.create_order(SYMBOL, 'market', 'sell', float(p['contracts']), params={'positionSide': 'LONG'})
+                        break
             entry_price = do_open('SHORT', price, reason)
             if entry_price:
                 state['short_pos'] = {'entry': entry_price, 'signal': reason, 'open_time': datetime.now().isoformat()}

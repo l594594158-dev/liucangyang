@@ -51,6 +51,7 @@ RANGE_PCT = 1.5              # 回调范围 ±1.5%
 VOL_RATIO_MIN = 1.0          # 量比 ≥ 1.0x
 RSI_LONG_MIN = 40            # LONG RSI > 40
 RSI_SHORT_MAX = 60           # SHORT RSI < 60
+COOLDOWN_SEC = 300           # 平仓后5分钟冷却，防同根K线重开
 
 # ========== 日志 ==========
 def log(msg):
@@ -198,11 +199,13 @@ def manage_positions(state, price, signal, reason, sma5m):
             log(f"🛑 LONG止损 | ${lp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
             do_close('LONG', price, lp, '止损')
             state['long_pos'] = None
+            state['last_exit_time'] = time.time()
             closed = True
         elif pnl >= TAKE_PROFIT_PCT:
             log(f"✅ LONG止盈 | ${lp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
             do_close('LONG', price, lp, '止盈')
             state['long_pos'] = None
+            state['last_exit_time'] = time.time()
             closed = True
 
     # ── SHORT止盈止损 ──
@@ -213,12 +216,22 @@ def manage_positions(state, price, signal, reason, sma5m):
             log(f"🛑 SHORT止损 | ${sp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
             do_close('SHORT', price, sp, '止损')
             state['short_pos'] = None
+            state['last_exit_time'] = time.time()
             closed = True
         elif pnl >= TAKE_PROFIT_PCT:
             log(f"✅ SHORT止盈 | ${sp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
             do_close('SHORT', price, sp, '止盈')
             state['short_pos'] = None
+            state['last_exit_time'] = time.time()
             closed = True
+
+    # ── 冷却检查 ──
+    last_exit = state.get('last_exit_time', 0)
+    if time.time() - last_exit < COOLDOWN_SEC:
+        remaining = int(COOLDOWN_SEC - (time.time() - last_exit))
+        if signal:
+            log(f"⏳ 冷却中 {remaining}s | 跳过{signal}")
+        return closed
 
     # ── 新信号（单币种互斥，只允许一仓）──
     has_any = (state.get('long_pos') is not None) or (state.get('short_pos') is not None)
@@ -513,6 +526,7 @@ def main():
     state = load_state()
     if 'long_pos' not in state: state['long_pos'] = None
     if 'short_pos' not in state: state['short_pos'] = None
+    if 'last_exit_time' not in state: state['last_exit_time'] = 0
 
     sync_state(state)
     log("📊 API Key已配置 | 合约K线分析+合约执行")
@@ -539,6 +553,7 @@ def main():
             state = load_state()
             if 'long_pos' not in state: state['long_pos'] = None
             if 'short_pos' not in state: state['short_pos'] = None
+            if 'last_exit_time' not in state: state['last_exit_time'] = 0
 
             price = data['5m']['price']
             sig, reason = check_entry(data)
@@ -552,6 +567,7 @@ def main():
             state = load_state()
             if 'long_pos' not in state: state['long_pos'] = None
             if 'short_pos' not in state: state['short_pos'] = None
+            if 'last_exit_time' not in state: state['last_exit_time'] = 0
 
             has_pos = bool(state.get('long_pos') or state.get('short_pos'))
             if has_pos:

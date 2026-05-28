@@ -350,59 +350,40 @@ def do_close(direction, price, pos_data, reason):
         work_log("错误", f"平仓失败: {e}")
 
 # ========== 挂止盈止损单 ==========
-def ensure_sl_tp(state, retries=1):
-    """
-    确保止盈止损单已挂。
-    开仓后可能存在短暂延迟导致查不到持仓，重试 retries 次。
-    """
-    # 频率控制：距上次检查不足30秒则跳过
-    now_ts = time.time()
-    if now_ts - state.get('last_sl_tp_check', 0) < 30:
-        return
-    state['last_sl_tp_check'] = now_ts
+def ensure_sl_tp(state):
+    """开仓后挂一次止盈止损单，已挂则跳过"""
     for d_key, direction in [('long_pos', 'LONG'), ('short_pos', 'SHORT')]:
         pos = state.get(d_key)
         if not pos:
             continue
-
-        # 带重试的持仓查询
+        
+        # 检查是否已挂过
+        mount_key = f'{d_key}_sl_tp_mounted'
+        if state.get(mount_key):
+            continue  # 已挂过，跳过
+        
+        # 查交易所持仓
+        try:
+            positions = trade_binance.fetch_positions()
+        except:
+            continue
+        
         qty = 0
         entry = pos['entry']
-        for attempt in range(retries + 1):
-            positions = trade_binance.fetch_positions()
-            for p in positions:
-                if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0:
-                    side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
-                    if side_check == direction:
-                        qty = float(p['contracts'])
-                        exchange_entry = float(p.get('entryPrice', 0))
-                        if exchange_entry > 0:
-                            entry = exchange_entry
-                        break
-            if qty > 0:
-                break
-            if attempt < retries:
-                time.sleep(1)
-                log(f"  等待持仓确认... ({attempt+1}/{retries})")
-
+        for p in positions:
+            if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0:
+                side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
+                if side_check == direction:
+                    qty = float(p['contracts'])
+                    ep = float(p.get('entryPrice', 0))
+                    if ep > 0:
+                        entry = ep
+                    break
+        
         if qty == 0:
-            # state 有记录但交易所查不到，说明可能已被平，清除 ghost
-            log(f"⚠️ {direction}本地有记录但交易所无持仓，清除")
-            if direction == 'LONG':
-                state['long_pos'] = None
-            else:
-                state['short_pos'] = None
-            # 保留 last_exit_time（manage_positions 已设置）
-            state.setdefault('last_exit_time', 0)
-            save_state(state)
-            continue
-
-        try:
-            algos = trade_binance.fapiprivate_get_openalgoorders({'symbol': 'BTCUSDT'})
-            existing = [o for o in algos if o.get('algoStatus') == 'NEW' and o.get('positionSide') == direction]
-        except:
-            existing = []
-
+            continue  # 没查到持仓，可能是刚开仓延迟，下轮再试
+        
+        # 计算SL/TP价格
         if direction == 'LONG':
             sl_p = round(entry * (1 - STOP_LOSS_PCT), 1)
             tp_p = round(entry * (1 + TAKE_PROFIT_PCT), 1)
@@ -411,26 +392,39 @@ def ensure_sl_tp(state, retries=1):
             sl_p = round(entry * (1 + STOP_LOSS_PCT), 1)
             tp_p = round(entry * (1 - TAKE_PROFIT_PCT), 1)
             close_side = 'buy'
-
-        sl_exist = any(o.get('orderType') == 'STOP_MARKET' for o in existing)
-        if not sl_exist:
+        
+        # 先查现有挂单，避免重复（用所有挂单，不限状态）
+        try:
+            all_orders = trade_binance.fapiprivate_get_openalgoorders({'symbol': SYMBOL.replace(':USDT', '')})
+        except:
+            all_orders = []
+        
+        existing_types = {o.get('type') or o.get('orderType', '') for o in all_orders 
+                         if o.get('positionSide') == direction}
+        
+        # 挂止损
+        if 'STOP_MARKET' not in existing_types:
             try:
                 trade_binance.create_order(SYMBOL, 'STOP_MARKET', close_side, qty,
                     params={'stopPrice': sl_p, 'positionSide': direction})
                 log(f"  挂SL: ${sl_p}")
             except Exception as e:
                 log(f"  SL挂单失败: {e}")
-
-        tp_exist = any(o.get('orderType') == 'TAKE_PROFIT_MARKET' for o in existing)
-        if not tp_exist:
+        
+        # 挂止盈
+        if 'TAKE_PROFIT_MARKET' not in existing_types:
             try:
                 trade_binance.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', close_side, qty,
                     params={'stopPrice': tp_p, 'positionSide': direction})
                 log(f"  挂TP: ${tp_p}")
             except Exception as e:
                 log(f"  TP挂单失败: {e}")
+        
+        # 标记已挂
+        state[mount_key] = True
+        save_state(state)
 
-# ========== 交易所→本地同步 ==========
+
 def sync_state(state):
     """
     以交易所为准同步本地状态：

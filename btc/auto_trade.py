@@ -311,7 +311,7 @@ def do_close(direction, price, pos_data, reason):
         positions = trade_binance.fetch_positions()
         qty = 0
         for p in positions:
-            if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0:
+            if float(p.get('contracts', 0)) > 0:
                 side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
                 if side_check == direction:
                     qty = float(p['contracts'])
@@ -353,20 +353,38 @@ def do_close(direction, price, pos_data, reason):
 
 # ========== 挂止盈止损单 ==========
 def ensure_sl_tp(state):
-    """开仓后挂一次止盈止损单，已挂则永不重复"""
+    """有持仓就挂止盈止损，已挂则跳过"""
+    mount_key = 'sl_tp_mounted'
+    if state.get(mount_key):
+        return
+    
     for d_key, direction in [('long_pos', 'LONG'), ('short_pos', 'SHORT')]:
         pos = state.get(d_key)
         if not pos:
             continue
         
-        # 已挂过，跳过（不验证交易所，避免查询干扰）
-        mount_key = f'{d_key}_sl_tp_mounted'
-        if state.get(mount_key):
-            continue
+        # 查交易所持仓数量
+        try:
+            positions = trade_binance.fetch_positions()
+        except:
+            return
         
+        qty = 0
         entry = pos['entry']
+        for p in positions:
+            if float(p.get('contracts', 0)) > 0:
+                side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
+                if side_check == direction:
+                    qty = float(p['contracts'])
+                    ep = float(p.get('entryPrice', 0))
+                    if ep > 0:
+                        entry = ep
+                    break
         
-        # 计算SL/TP价格
+        if qty == 0:
+            return  # 持仓未就绪，下轮再试
+        
+        # 计算价格
         if direction == 'LONG':
             sl_p = round(entry * (1 - STOP_LOSS_PCT), 1)
             tp_p = round(entry * (1 + TAKE_PROFIT_PCT), 1)
@@ -376,26 +394,9 @@ def ensure_sl_tp(state):
             tp_p = round(entry * (1 - TAKE_PROFIT_PCT), 1)
             close_side = 'buy'
         
-        # 查交易所持仓数量
-        try:
-            positions = trade_binance.fetch_positions()
-        except:
-            continue
-        
-        qty = 0
-        for p in positions:
-            if p.get('symbol') == SYMBOL and float(p.get('contracts', 0)) > 0:
-                side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
-                if side_check == direction:
-                    qty = float(p['contracts'])
-                    break
-        
-        if qty == 0:
-            continue
-        
         # 挂SL
         try:
-            trade_binance.create_order(SYMBOL, 'STOP_MARKET', close_side, qty,
+            trade_binance.create_order(SYMBOL, 'STOP_MARKET', close_side, int(qty),
                 params={'stopPrice': sl_p, 'positionSide': direction})
             log(f"  挂SL: ${sl_p}")
         except Exception as e:
@@ -403,7 +404,7 @@ def ensure_sl_tp(state):
         
         # 挂TP
         try:
-            trade_binance.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', close_side, qty,
+            trade_binance.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', close_side, int(qty),
                 params={'stopPrice': tp_p, 'positionSide': direction})
             log(f"  挂TP: ${tp_p}")
         except Exception as e:
@@ -411,6 +412,8 @@ def ensure_sl_tp(state):
         
         state[mount_key] = True
         save_state(state)
+        return  # 双向各一仓，只挂当前有的
+
 
 def sync_state(state):
     """
@@ -463,10 +466,12 @@ def sync_state(state):
     if not has_long and state.get('long_pos'):
         log("🔄 交易所LONG已消失，清除本地")
         state['long_pos'] = None
+        state['last_exit_time'] = time.time()
         changed = True
     if not has_short and state.get('short_pos'):
         log("🔄 交易所SHORT已消失，清除本地")
         state['short_pos'] = None
+        state['last_exit_time'] = time.time()
         changed = True
 
     if changed:

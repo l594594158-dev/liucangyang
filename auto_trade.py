@@ -43,7 +43,7 @@ NOTIFY_QUEUE = f'{BASE_DIR}/databases/notify_queue.json'
 STOP_LOSS_PCT = 1.0 / 100
 TAKE_PROFIT_PCT = 1.2 / 100
 POLL_INTERVAL = 2          # 扫描间隔（秒）
-COOLDOWN_SEC = 300          # 平仓后冷却时间（秒），避免TP→同根K线重开
+COOLDOWN_CANDLE = True      # 平仓冷却：等平仓那根5mK线收盘后才允许重开
 
 # ========== 日志 ==========
 def log(msg):
@@ -59,7 +59,7 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {'long_pos': None, 'short_pos': None, 'last_exit_time': 0}
+    return {'long_pos': None, 'short_pos': None, 'last_exit_candle_open': 0}
 
 def save_state(s):
     with open(STATE_FILE, 'w') as f:
@@ -177,7 +177,7 @@ def check_entry(data):
     return None, f"观望 | 4h{dir_4h} RSI={rsi5m:.1f} ADX1h={adx1h:.1f}"
 
 # ========== 双向各1仓管理 ==========
-def manage_positions(state, price, signal, reason):
+def manage_positions(state, price, signal, reason, kline_open_time):
     closed = False
 
     # ── LONG止盈止损 ──
@@ -188,13 +188,13 @@ def manage_positions(state, price, signal, reason):
             log(f"🛑 LONG止损 | ${lp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
             do_close('LONG', price, lp, '止损')
             state['long_pos'] = None
-            state['last_exit_time'] = time.time()
+            state['last_exit_candle_open'] = kline_open_time
             closed = True
         elif pnl >= TAKE_PROFIT_PCT:
             log(f"✅ LONG止盈 | ${lp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
             do_close('LONG', price, lp, '止盈')
             state['long_pos'] = None
-            state['last_exit_time'] = time.time()
+            state['last_exit_candle_open'] = kline_open_time
             closed = True
 
     # ── SHORT止盈止损 ──
@@ -205,22 +205,21 @@ def manage_positions(state, price, signal, reason):
             log(f"🛑 SHORT止损 | ${sp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
             do_close('SHORT', price, sp, '止损')
             state['short_pos'] = None
-            state['last_exit_time'] = time.time()
+            state['last_exit_candle_open'] = kline_open_time
             closed = True
         elif pnl >= TAKE_PROFIT_PCT:
             log(f"✅ SHORT止盈 | ${sp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
             do_close('SHORT', price, sp, '止盈')
             state['short_pos'] = None
-            state['last_exit_time'] = time.time()
+            state['last_exit_candle_open'] = kline_open_time
             closed = True
 
-    # ── 冷却期检查 ──
-    elapsed = time.time() - state.get('last_exit_time', 0)
-    if elapsed < COOLDOWN_SEC:
-        remaining = COOLDOWN_SEC - elapsed
+    # ── K线冷却检查：当前K线open_time ≤ 平仓K线open_time → 同根或更旧，跳过
+    last_exit_open = state.get('last_exit_candle_open', 0)
+    if last_exit_open and kline_open_time <= last_exit_open:
         if closed:
-            log(f"⏳ 平仓冷却 {COOLDOWN_SEC}s | 剩余{remaining:.0f}s内跳过信号")
-        return closed  # 冷却期内跳过信号检测，直接返回
+            log(f"⏳ 平仓冷却 | 等当前5mK线收盘后重开")
+        return closed  # 同一根K线内，跳过信号检测
 
     # ── 新信号（多空互斥：任一方有仓则跳过）──
     has_any_pos = bool(state.get('long_pos') or state.get('short_pos'))
@@ -515,12 +514,14 @@ def main():
             state = load_state()
             if 'long_pos' not in state: state['long_pos'] = None
             if 'short_pos' not in state: state['short_pos'] = None
-            if 'last_exit_time' not in state: state['last_exit_time'] = 0
+            if 'last_exit_candle_open' not in state: state['last_exit_candle_open'] = 0
 
             price = data['5m']['price']
             sig, reason = check_entry(data)
 
-            manage_positions(state, price, sig, reason)
+            # 当前5mK线open_time（毫秒戳），用于冷却判断
+            kline5m_open = int(df5m.iloc[-1]['t'])
+            manage_positions(state, price, sig, reason, kline5m_open)
 
             has_pos = bool(state.get('long_pos') or state.get('short_pos'))
             if has_pos:

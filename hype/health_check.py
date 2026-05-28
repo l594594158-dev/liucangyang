@@ -110,7 +110,7 @@ class HealthChecker:
                 self.add_ok('进程状态', f'PID={my_pid} 运行中')
                 return True
 
-            self.add_fail('进程状态', '进程未运行', fix='restart')
+            self.add_fail('进程状态', '进程未运行', fix='#restart_disabled')
             return False
         except Exception as e:
             self.add_fail('进程状态', f'检查失败: {e}')
@@ -248,7 +248,7 @@ class HealthChecker:
             self.add_fail('API-网络', f'网络错误: {e}', fix='network')
             return False
         except Exception as e:
-            self.add_fail('API-数据', f'获取失败: {e}', fix='restart')
+            self.add_fail('API-数据', f'获取失败: {e}', fix='#restart_disabled')
             import traceback; traceback.print_exc()
             return False
 
@@ -305,7 +305,7 @@ class HealthChecker:
                 mismatches.append('SHORT本地有但交易所无(幽灵)')
 
             if mismatches:
-                self.add_fail('持仓同步', '; '.join(mismatches), fix='restart')
+                self.add_fail('持仓同步', '; '.join(mismatches), fix='#restart_disabled')
             else:
                 total = len(actual_positions)
                 self.add_ok('持仓同步', f'一致 | {"无持仓" if total==0 else f"{total}仓"}')
@@ -387,7 +387,7 @@ class HealthChecker:
 
             return True
         except Exception as e:
-            self.add_fail('策略状态', f'检查失败: {e}', fix='restart')
+            self.add_fail('策略状态', f'检查失败: {e}', fix='#restart_disabled')
             return False
 
     # ========== 检查5: 通知队列（仅检查积压，不发送）==========

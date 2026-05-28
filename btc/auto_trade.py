@@ -396,7 +396,7 @@ def ensure_sl_tp(state):
         
         # 挂SL
         try:
-            trade_binance.create_order(SYMBOL, 'STOP_MARKET', close_side, int(qty),
+            trade_binance.create_order(SYMBOL, 'STOP_MARKET', close_side, qty,
                 params={'stopPrice': sl_p, 'positionSide': direction})
             log(f"  挂SL: ${sl_p}")
         except Exception as e:
@@ -404,7 +404,7 @@ def ensure_sl_tp(state):
         
         # 挂TP
         try:
-            trade_binance.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', close_side, int(qty),
+            trade_binance.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', close_side, qty,
                 params={'stopPrice': tp_p, 'positionSide': direction})
             log(f"  挂TP: ${tp_p}")
         except Exception as e:

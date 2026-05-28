@@ -58,3 +58,16 @@
 
 1. ZEC SL 挂单偶尔被币安拒绝（价格太接近市价，code:-2021）
 2. health_check 通知队列修复逻辑仍需进一步优化
+
+### 9. health_check 孤儿单清理误伤其他币种
+**问题**：BTC health_check 的 `fapiprivate_get_openalgoorders({'symbol': 'BTCUSDT'})` 可能返回了所有合约的挂单，导致 HYPE/NEAR/ZEC 挂单被误清。
+**修复**：在清理循环中加 `if o.get('symbol') != symbol_raw: continue`（不属于自己币种的挂单跳过）
+**发现时间**：22:43 BTC health_check 清掉6条挂单（HYPE 2 + NEAR 2 + ZEC 2）
+
+### 10. health_check 禁用自动重启
+**问题**：自检检测到通知队列积压 → 触发 forward_notify 修复 → 重启 auto_trade 进程 → 挂单丢失。
+**修复**：禁用了 health_check 的 restart 修复路径。
+
+### 11. cron 改为每1分钟
+**问题**：5分钟间隔孤儿单清理不及时。
+**修复**：cron 从 */5 改为 */1。

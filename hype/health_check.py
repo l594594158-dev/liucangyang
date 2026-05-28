@@ -336,6 +336,9 @@ class HealthChecker:
                 pos_side = o.get('positionSide', '')
                 if not algo_id:
                     continue
+                # 保护：只清理自己币种的挂单（防止API返回了其他币种）
+                if o.get('symbol') != symbol_raw:
+                    continue
                 should_exist = (pos_side == 'LONG' and has_long) or (pos_side == 'SHORT' and has_short)
                 if not should_exist:
                     try:

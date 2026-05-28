@@ -360,10 +360,21 @@ def ensure_sl_tp(state):
         if not pos:
             continue
         
-        # 检查是否已挂过
+        # 检查是否已挂过，但先验证交易所挂单是否真在
         mount_key = f'{d_key}_sl_tp_mounted'
         if state.get(mount_key):
-            continue  # 已挂过，跳过
+            # 验证交易所挂单是否存在
+            try:
+                symbol_raw = SYMBOL.replace(':USDT', '')
+                check_orders = trade_binance.fapiprivate_get_openalgoorders({'symbol': symbol_raw})
+                has_sl = any(o.get('orderType') == 'STOP_MARKET' and o.get('positionSide') == direction for o in check_orders)
+                has_tp = any(o.get('orderType') == 'TAKE_PROFIT_MARKET' and o.get('positionSide') == direction for o in check_orders)
+                if has_sl and has_tp:
+                    continue  # 挂单确实在，跳过
+                # 挂单不在了，重置标记重新挂
+                state[mount_key] = False
+            except:
+                continue
         
         # 查交易所持仓
         try:

@@ -34,7 +34,7 @@ NOTIFY_QUEUE = f'{TASK_DIR}/databases/notify_queue.json'
 from api_config import TRADE_API_KEY, TRADE_SECRET
 
 SYMBOL = 'BTC/USDT:USDT'
-QTY = 0.07
+QTY = 0.025
 POLL_INTERVAL = 2
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -120,15 +120,17 @@ class HealthChecker:
     def check_api_data(self):
         """检查API数据获取 + v4.3 6条件门控信号状态"""
         try:
-            # 用现货K线（与auto_trade.py一致）
-            result = []
-            for tf, limit in [('5m', 100), ('1h', 200), ('4h', 200), ('1d', 200)]:
+            # 用现货REST K线（与auto_trade.py一致）
+            import requests
+            def fetch_klines(tf, limit):
                 url = f'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={tf}&limit={limit}'
-                r = req.get(url, timeout=5)
-                klines = r.json()
-                data = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in klines]
-                result.append(data)
-            k5m, k1h, k4h, k1d = result
+                resp = requests.get(url, timeout=5)
+                klines = resp.json()
+                return [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in klines]
+            k5m = fetch_klines('5m', 100)
+            k1h = fetch_klines('1h', 200)
+            k4h = fetch_klines('4h', 200)
+            k1d = fetch_klines('1d', 200)
 
             for name, data in [('5分钟', k5m), ('1小时', k1h), ('4小时', k4h), ('1天', k1d)]:
                 if len(data) < 50:
@@ -158,6 +160,7 @@ class HealthChecker:
                 vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1
                 close_closed = close.iloc[closed_lv]
                 sma_closed = ta.trend.SMAIndicator(close, 20).sma_indicator().iloc[closed_lv]
+                rsi_closed = ta.momentum.RSIIndicator(close, 14).rsi().iloc[closed_lv]
                 try:
                     adx_closed = adx_ind.adx().iloc[closed_lv]
                 except:
@@ -165,7 +168,7 @@ class HealthChecker:
                 return {
                     'price': price, 'sma20': sma20, 'rsi': rsi, 'adx': adx,
                     'vol_ratio': vol_ratio,
-                    'close_closed': close_closed, 'sma_closed': sma_closed, 'adx_closed': adx_closed
+                    'close_closed': close_closed, 'sma_closed': sma_closed, 'adx_closed': adx_closed, 'rsi_closed': rsi_closed
                 }
 
             r5 = calc_v4(k5m)
@@ -174,16 +177,16 @@ class HealthChecker:
             rd = calc_v4(k1d)
 
             price = r5['price']
-            rsi5m = r5['rsi']
+            rsi5m = r5.get('rsi_closed', r5['rsi'])  # 闭K RSI
             adx1h = r1.get('adx_closed', r1['adx'])
             adx4h = r4.get('adx_closed', r4['adx'])
             vol_ratio = r5['vol_ratio']
             sma5m = r5['sma20']
 
-            # 4h方向（闭K）
-            h4_close = r4.get('close_closed', r4['price'])
-            sma4h = r4.get('sma_closed', r4['sma20'])
-            h4_bull = h4_close > sma4h
+            # 1h方向（闭K，与auto_trade check_entry一致）
+            h1_close = r1.get('close_closed', r1['price'])
+            sma1h = r1.get('sma_closed', r1['sma20'])
+            h1_bull = h1_close > sma1h
             # 1d方向（闭K）
             d1_close = rd.get('close_closed', rd['price'])
             sma1d = rd.get('sma_closed', rd['sma20'])
@@ -192,11 +195,8 @@ class HealthChecker:
             # SMA20 ±1%回调范围
             # ===== v4.3 6条件门控逐级判断 =====
             gate = []
-            # 第1关：方向同向
-            if h4_bull == d1_bull:
-                gate.append(f'✅ 1/6 方向同向')
-            else:
-                gate.append(f'❌ 1/6 4h{"多" if h4_bull else "空"}/1d{"多" if d1_bull else "空"}不同向')
+            # 第1关：1h方向
+            gate.append(f'✅ 1/6 1h方向: {"📈多" if h1_bull else "📉空"}')
             # 第2关：1h ADX > 20
             if adx1h > 20:
                 gate.append(f'✅ 2/6 1hADX={adx1h:.1f}>20')
@@ -219,29 +219,29 @@ class HealthChecker:
             else:
                 gate.append(f'❌ 5/6 缩量vol={vol_ratio:.1f}x')
             # 第6关：RSI门控（LONG/Short按方向自动判断）
-            if h4_bull and d1_bull:
-                if rsi5m > 40:
-                    gate.append(f'✅ 6/6 RSI={rsi5m:.1f}>40 → LONG')
+            if h1_bull:
+                if rsi5m >= 40:
+                    gate.append(f'✅ 6/6 RSI={rsi5m:.1f}>=40 → LONG')
                 else:
-                    gate.append(f'❌ 6/6 RSI={rsi5m:.1f}≤40 → LONG不触发')
-            elif (not h4_bull) and (not d1_bull):
-                if rsi5m < 60:
-                    gate.append(f'✅ 6/6 RSI={rsi5m:.1f}<60 → SHORT')
+                    gate.append(f'❌ 6/6 RSI={rsi5m:.1f}<40 → LONG不触发')
+            else:
+                if rsi5m <= 60:
+                    gate.append(f'✅ 6/6 RSI={rsi5m:.1f}<=60 → SHORT')
                 else:
-                    gate.append(f'❌ 6/6 RSI={rsi5m:.1f}≥60 → SHORT不触发')
+                    gate.append(f'❌ 6/6 RSI={rsi5m:.1f}>60 → SHORT不触发')
 
             # 决定最终状态
             all_pass = all('✅' in g for g in gate)
             if all_pass:
-                dir_str = '多' if h4_bull else '空'
-                sig_str = f'LONG(RSI>{rsi5m:.1f})' if (h4_bull and d1_bull) else f'SHORT(RSI<{rsi5m:.1f})'
+                dir_str = '多' if h1_bull else '空'
+                sig_str = f'LONG(RSI>{rsi5m:.1f})' if (h1_bull and d1_bull) else f'SHORT(RSI<{rsi5m:.1f})'
                 self.add_ok('API数据', f'各周期正常 | ${price:,.0f} | 6条件全通→{sig_str}')
             else:
                 fail_count = sum(1 for g in gate if '❌' in g)
                 self.add_ok('API数据', f'各周期正常 | ${price:,.0f} | 6条件中{fail_count}项未通过')
 
             self.add_ok('6条件门控', ' | '.join(gate[:6]))
-            self.add_ok('趋势状态', f'4h:{"📈多" if h4_bull else "📉空"} | 1d:{"📈多" if d1_bull else "📉空"} | ADX1h={adx1h:.1f} ADX4h={adx4h:.1f} vol={vol_ratio:.1f}x')
+            self.add_ok('趋势状态', f'1h:{"📈多" if h1_bull else "📉空"} | 1d:{"📈多" if d1_bull else "📉空"} | ADX1h={adx1h:.1f} ADX4h={adx4h:.1f} vol={vol_ratio:.1f}x')
             return True
 
         except req.exceptions.RequestException as e:
@@ -260,7 +260,7 @@ class HealthChecker:
             exchange_pos = binance.fetch_positions([SYMBOL])
             actual_positions = [p for p in exchange_pos if float(p.get('contracts', 0)) != 0]
 
-            # 读取本地state（v4.2格式）
+            # 读取本地state（v4.3格式）
             state_long_pos = None
             state_short_pos = None
             if os.path.exists(STATE_FILE):
@@ -282,7 +282,8 @@ class HealthChecker:
                         mismatches.append(f'LONG仓({qty}BTC)本地缺失')
                     else:
                         diff = abs(float(state_long_pos['entry']) - entry)
-                        if diff > 50:
+                        diff_pct = abs(diff / entry) if entry > 0 else 0
+                        if diff_pct > 0.1:
                             mismatches.append(f'LONG入场价偏差${diff:.0f}')
                         if qty > QTY * 1.1:
                             mismatches.append(f'LONG数量({qty})超过QTY({QTY})')
@@ -291,7 +292,8 @@ class HealthChecker:
                         mismatches.append(f'SHORT仓({qty}BTC)本地缺失')
                     else:
                         diff = abs(float(state_short_pos['entry']) - entry)
-                        if diff > 50:
+                        diff_pct = abs(diff / entry) if entry > 0 else 0
+                        if diff_pct > 0.1:
                             mismatches.append(f'SHORT入场价偏差${diff:.0f}')
                         if qty > QTY * 1.1:
                             mismatches.append(f'SHORT数量({qty})超过QTY({QTY})')
@@ -300,9 +302,21 @@ class HealthChecker:
             ex_long = any(p['side'] == 'long' for p in actual_positions)
             ex_short = any(p['side'] == 'short' for p in actual_positions)
             if not ex_long and state_long_pos:
-                mismatches.append('LONG本地有但交易所无(幽灵)')
+                mismatches.append('LONG本地有但交易所无(幽灵)→自动清除')
+                state['long_pos'] = None
+                state['last_exit_time'] = time.time()
+                state.pop('sl_tp_mounted', None)
+                with open(STATE_FILE, 'w') as _f:
+                    json.dump(state, _f)
+                # 幽灵仓已自动清除
             if not ex_short and state_short_pos:
-                mismatches.append('SHORT本地有但交易所无(幽灵)')
+                mismatches.append('SHORT本地有但交易所无(幽灵)→自动清除')
+                state['short_pos'] = None
+                state['last_exit_time'] = time.time()
+                state.pop('sl_tp_mounted', None)
+                with open(STATE_FILE, 'w') as _f:
+                    json.dump(state, _f)
+                # 幽灵仓已自动清除
 
             if mismatches:
                 self.add_fail('持仓同步', '; '.join(mismatches), fix='#restart_disabled')
@@ -319,7 +333,7 @@ class HealthChecker:
         """Clean orphan algo orders"""
         try:
             binance = get_binance()
-            symbol_raw = SYMBOL.replace(':USDT', '')
+            symbol_raw = SYMBOL.split(':')[0].replace('/', '')
             positions = binance.fetch_positions([SYMBOL])
             has_long = any(float(p.get('contracts', 0)) > 0 and p.get('side') == 'long' for p in positions)
             has_short = any(float(p.get('contracts', 0)) > 0 and p.get('side') == 'short' for p in positions)
@@ -358,7 +372,7 @@ class HealthChecker:
     # ========== 检查4: 策略文件状态 ==========
     def check_strategy(self):
         try:
-            # state.json（v4.2格式）
+            # state.json（v4.3格式）
             if os.path.exists(STATE_FILE):
                 with open(STATE_FILE) as f:
                     state = json.load(f)

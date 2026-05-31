@@ -460,7 +460,6 @@ def ensure_sl_tp(state):
             all_orders = []
         
         # 过滤：只匹配当前symbol + 当前方向的algo订单
-        for o in all_orders:
         own_orders = [o for o in all_orders
                       if o.get('symbol') == symbol_raw
                       and o.get('positionSide') == direction]

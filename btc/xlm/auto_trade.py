@@ -173,6 +173,10 @@ def check_signal(kl_15m, kl_1h):
 
     pi = n - 2  # lv-1 闭K
 
+    # 硬保护: 指标数据长度不足→拒绝信号
+    if pi < 0 or pi-1 < 0 or pi >= len(ema3) or pi >= len(ema10) or pi >= len(vr) or pi >= len(rsi_v):
+        return None
+
     # ① EMA3/EMA10 纯方向锚定
     long_dir  = ema3[pi] > ema10[pi]
     short_dir = ema3[pi] < ema10[pi]

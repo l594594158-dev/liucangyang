@@ -189,6 +189,11 @@ def check_signal(kl_1h, kl_4h):
     adx1  = adx(highs, lows, closes, 14)
     vr    = vol_ratio(vols, 20)
 
+    # 硬保护: 指标数据长度不足→拒绝信号
+    pi = n - 2
+    if pi < 0 or pi-1 < 0 or pi >= len(vr) or pi >= len(adx1) or pi >= len(rsi_v) or pi >= len(ema5):
+        return None
+
     # 4h ADX 映射
     t_4h = [k['t'] for k in kl_4h]
     c4h  = [k['c'] for k in kl_4h]

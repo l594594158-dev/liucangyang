@@ -187,6 +187,10 @@ def check_signal(kl_5m, kl_1h, kl_4h, live_price):
 
     pi = n5 - 2      # lv-1 刚闭K
 
+    # 硬保护: 指标数据长度不足→拒绝信号
+    if pi < 0 or pi-1 < 0 or pi >= len(ema5) or pi >= len(ema10) or pi >= len(vr) or pi >= len(rsi_v):
+        return None
+
     # ① EMA5/EMA10 纯方向锚定
     long_dir  = ema5[pi] > ema10[pi]
     short_dir = ema5[pi] < ema10[pi]

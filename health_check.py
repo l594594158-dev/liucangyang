@@ -126,7 +126,7 @@ def main():
             log(f"[{name}] 孤儿LONG {excess}张 (state={state_long_qty} ex={ex_long})")
             try:
                 exchange.create_order(symbol=sym, type='market', side='sell',
-                    amount=excess, params={'reduceOnly': 'true', 'positionSide': 'LONG'})
+                    amount=excess, params={'reduceOnly': True, 'positionSide': 'LONG'})
                 log(f"[{name}] 已平孤儿LONG {excess}张")
             except Exception as e:
                 log(f"[{name}] 平仓失败: {e}")
@@ -136,7 +136,7 @@ def main():
             log(f"[{name}] 孤儿SHORT {excess}张 (state={state_short_qty} ex={ex_short})")
             try:
                 exchange.create_order(symbol=sym, type='market', side='sell',
-                    amount=excess, params={'reduceOnly': 'true', 'positionSide': 'SHORT'})
+                    amount=excess, params={'reduceOnly': True, 'positionSide': 'SHORT'})
                 log(f"[{name}] 已平孤儿SHORT {excess}张")
             except Exception as e:
                 log(f"[{name}] 平仓失败: {e}")

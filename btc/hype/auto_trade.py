@@ -79,7 +79,7 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {'longpositions': [], 'shortpositions': [], 'lastexitkl_time': 0}
+    return {'longpositions': [], 'shortpositions': [], 'lastexitkl_time': 0, 'lastentrykl_time': 0}
 
 def save_state(s):
     tmp = STATE_FILE + '.tmp'
@@ -323,6 +323,7 @@ def open_position(side, price, state):
         else:
             state['shortpositions'].append(new_pos)
 
+        state['lastentrykl_time'] = int(time.time() // 300) * 300 * 1000
         save_state(state)
 
         msg = f"HYPE {side}开仓: entry={fill_price:.4f} qty={QTY}"
@@ -416,6 +417,7 @@ def main():
             state.setdefault('longpositions', [])
             state.setdefault('shortpositions', [])
             state.setdefault('lastexitkl_time', 0)
+            state.setdefault('lastentrykl_time', 0)
 
             manage_positions(state)
             save_state(state)
@@ -426,6 +428,10 @@ def main():
 
             current_kl = int(kl_5m[-1]['t'])
             if state['lastexitkl_time'] >= current_kl:
+                time.sleep(1)
+                continue
+            # 同K线只开一次
+            if state['lastentrykl_time'] >= current_kl:
                 time.sleep(1)
                 continue
 

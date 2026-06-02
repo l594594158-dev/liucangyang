@@ -1,685 +1,445 @@
 #!/usr/bin/env python3
 """
-BTC合约 趋势回调策略 v4.3
-- 6条件简化 + TP1.2%/SL1.0% + 双向共存
-- 现货K线计算 + 合约执行
+BTC v4.0 EMA5/10 1h交叉策略 — Binance合约
+精简版: 合约K线直读 + 1h/4h双周期 + 5条件AND
+入场: 1h闭K信号 → 下一根开盘入场
+平仓: 实时价触发TP/SL
+
+策略参数:
+  方向: 1h EMA5/EMA10 金叉做多 / 死叉做空 (lv-1闭K)
+  条件: ①EMA方向 ②ADX1h>20 ③ADX4h<50 ④RSI区间 ⑤量比>3.0
+  仓位: 3仓/边 (longpos/shortpos数组)
+  TP/SL: +2.0%/-5.0%
+  手续费: 双边0.05%
 """
+
 import ccxt
-import requests
-import pandas as pd
-import ta
-import time
 import json
 import os
-import math
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
-# ========== API 双Key架构 ==========
+# ========== API ==========
 from api_config import READ_API_KEY, READ_SECRET, TRADE_API_KEY, TRADE_SECRET
 
-# 行情分析实例（读取权限）
-read_binance = ccxt.binance({
-    'apiKey': READ_API_KEY,
-    'secret': READ_SECRET,
-    'options': {'defaultType': 'swap'}
-})
-
-# 交易执行实例（交易权限）
-trade_binance = ccxt.binance({
+exchange = ccxt.binance({
     'apiKey': TRADE_API_KEY,
     'secret': TRADE_SECRET,
-    'options': {'defaultType': 'swap'}
+    'options': {'defaultType': 'swap'},
+    'enableRateLimit': True,
 })
 
 SYMBOL = 'BTC/USDT:USDT'
-QTY = 0.025
+QTY = 0.005       # 50张 (Binance最小0.001 BTC)
 LEVERAGE = 20
+
 BASE_DIR = '/root/liucangyang'
-STATE_FILE = f'{BASE_DIR}/databases/state.json'
-WORK_LOG = f'{BASE_DIR}/logs/work_log.txt'
+STATE_FILE = f'{BASE_DIR}/databases/state_btc.json'
+PAUSE_FILE = f'{BASE_DIR}/databases/btc_pause.flag'
 NOTIFY_QUEUE = f'{BASE_DIR}/databases/notify_queue.json'
+WORK_LOG = f'{BASE_DIR}/logs/btc_work_log.txt'
 
-# ========== 策略参数 v4.3 ==========
-STOP_LOSS_PCT = 1.2 / 100   # -1.2%止损
-TAKE_PROFIT_PCT = 1.0 / 100 # +1.0%止盈
-POLL_INTERVAL = 1            # 扫描间隔（秒）
+# ========== 策略参数 ==========
+TP_PCT = 0.02
+SL_PCT = 0.05
+MAX_POS = 3
 
-# 5条件阈值
-ADX_1H_MIN = 20              # 1h ADX > 20 (滤横盘)
-ADX_4H_MAX = 55              # 4h ADX < 55 (防追末端过热)
-RANGE_PCT = 1.0              # 回调范围 ±1.0%
-VOL_RATIO_MIN = 1.0          # 量比 ≥ 1.0x
-RSI_LONG_MIN = 40            # LONG RSI > 40
-RSI_SHORT_MAX = 60           # SHORT RSI < 60
-COOLDOWN_SEC = 300           # 平仓后等下一根5m K线闭合（最长300s兜底）
+ADX_1H_MIN = 20
+ADX_4H_MAX = 50
+RSI_LONG_MIN = 40
+RSI_SHORT_MAX = 60
+VOL_RATIO_MIN = 3.0
 
 # ========== 日志 ==========
 def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+    stamp = datetime.now().strftime('%H:%M:%S')
+    print(f"[{stamp}] {msg}")
 
 def work_log(event, detail):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open(WORK_LOG, 'a') as f:
         f.write(f"[{ts}] [{event}] {detail}\n")
 
+def notify(msg):
+    try:
+        items = []
+        if os.path.exists(NOTIFY_QUEUE):
+            with open(NOTIFY_QUEUE) as f:
+                items = json.load(f)
+        items.append({'msg': msg, 'sent': False})
+        with open(NOTIFY_QUEUE, 'w') as f:
+            json.dump(items, f, ensure_ascii=False)
+    except:
+        pass
+
 # ========== 状态管理 ==========
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {'long_pos': None, 'short_pos': None}
+    return {'longpos': [], 'shortpos': [], 'lastexitkl_time': 0, 'lastentrykl_time': 0}
 
 def save_state(s):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(s, f)
+    tmp = STATE_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(s, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
+    os.rename(tmp, STATE_FILE)
 
-# ========== 通知 ==========
-def notify_alert(msg):
-    ts = datetime.now().isoformat()
-    try:
-        queue = []
-        if os.path.exists(NOTIFY_QUEUE):
-            with open(NOTIFY_QUEUE) as f:
-                queue = json.load(f)
-        queue.append({'time': ts, 'msg': msg, 'sent': False})
-        queue = queue[-50:]
-        with open(NOTIFY_QUEUE, 'w') as f:
-            json.dump(queue, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log(f'⚠️ 通知写入失败: {e}')
+# ========== 指标计算 (Wilder平滑) ==========
+def ema(series, period):
+    """EMA: α=2/(period+1), SMA初始化"""
+    if not series: return []
+    k = 2.0 / (period + 1)
+    r = [series[0]]
+    for v in series[1:]:
+        r.append(r[-1] + k * (v - r[-1]))
+    return r
+
+def rsi(series, period=14):
+    """Wilder RSI"""
+    n = len(series)
+    if n < period + 1:
+        return [50.0] * n
+    r = [50.0] * period
+    gain = sum(max(series[i]-series[i-1],0) for i in range(1,period+1)) / period
+    loss = sum(abs(min(series[i]-series[i-1],0)) for i in range(1,period+1)) / period
+    for i in range(period, n):
+        r.append(100.0 - 100.0/(1.0+gain/loss) if loss>0 else 100.0)
+        if i+1 < n:
+            diff = series[i+1] - series[i]
+            gain = (gain*(period-1) + max(diff,0)) / period
+            loss = (loss*(period-1) + abs(min(diff,0))) / period
+    return r
+
+def adx(highs, lows, closes, period=14):
+    """Wilder ADX (与ta库ADX一致)"""
+    n = len(highs)
+    if n < period*2:
+        return [0.0]*n
+    tr, pdm, mdm = [0.0]*n, [0.0]*n, [0.0]*n
+    for i in range(1, n):
+        tr[i] = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        hh, ll = highs[i]-highs[i-1], lows[i-1]-lows[i]
+        pdm[i] = hh if (hh>ll and hh>0) else 0.0
+        mdm[i] = ll if (ll>hh and ll>0) else 0.0
+    atr, pde, mde, dx = [0.0]*n, [0.0]*n, [0.0]*n, [0.0]*n
+    atr[period] = sum(tr[1:period+1])
+    pde[period] = sum(pdm[1:period+1])
+    mde[period] = sum(mdm[1:period+1])
+    for i in range(period+1, n):
+        atr[i] = atr[i-1] - atr[i-1]/period + tr[i]
+        pde[i] = pde[i-1] - pde[i-1]/period + pdm[i]
+        mde[i] = mde[i-1] - mde[i-1]/period + mdm[i]
+    for i in range(period, n):
+        if atr[i]==0: dx[i]=0.0; continue
+        pdi = 100*pde[i]/atr[i]; mdi = 100*mde[i]/atr[i]
+        den = pdi+mdi; dx[i] = 100*abs(pdi-mdi)/den if den else 0.0
+    adx_s = [0.0]*n
+    adx_s[period*2-1] = sum(dx[period:period*2])/period
+    for i in range(period*2, n):
+        adx_s[i] = (adx_s[i-1]*(period-1)+dx[i])/period
+    return adx_s
+
+def vol_ratio(vols, period=20):
+    """量比=vol[i]/mean(vol[i-period...i]) 使用i之前20根"""
+    r = [1.0]*period
+    w = vols[:period]
+    for i in range(period, len(vols)):
+        avg = sum(w)/period
+        r.append(vols[i]/avg if avg>0 else 1.0)
+        w.pop(0); w.append(vols[i])
+    return r
 
 # ========== 数据获取 ==========
-def get_data():
-    """用合约K线做指标计算，合约做执行"""
-    result = []
-    for tf, limit in [('5m', 100), ('1h', 200), ('4h', 200), ('1d', 200)]:
-        try:
-            url = f'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval={tf}&limit={limit}'
-            resp = requests.get(url, timeout=5)
-            klines = resp.json()
-            data = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in klines]
-            result.append(data)
-        except Exception as e:
-            log(f'获取{tf}失败: {e}')
-            result.append([])
-    return result
+def fetch_klines(interval, limit=200):
+    """获取合约K线 (fapi)"""
+    return exchange.fetch_ohlcv(SYMBOL, interval, limit=limit)
 
-def calc(df):
-    close = df['c']
-    high = df['h']
-    low = df['l']
-    volume = df['v']
-    lv = len(df) - 1
-
-    price = close.iloc[lv]
-    sma10 = ta.trend.SMAIndicator(close, 10).sma_indicator().iloc[lv]
-    rsi = ta.momentum.RSIIndicator(close, 14).rsi().iloc[lv]
-
-    try:
-        adx_ind = ta.trend.ADXIndicator(high, low, close, window=14)
-        adx = adx_ind.adx().iloc[lv]
-    except:
-        adx = 25
-
-    # 闭K指标 (与回测一致)
-    closed_lv = max(0, lv - 1)
-    avg_vol = volume.iloc[max(0, closed_lv-19):closed_lv+1].mean()
-    cur_vol = volume.iloc[closed_lv]
-    vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1
-
-    close_closed = close.iloc[closed_lv]
-    sma_closed = ta.trend.SMAIndicator(close, 10).sma_indicator().iloc[closed_lv]
-    adx_closed = adx_ind.adx().iloc[closed_lv]
-    rsi_closed = ta.momentum.RSIIndicator(close, 14).rsi().iloc[closed_lv]
-
+def extract(k):
     return {
-        'price': price, 'sma10': sma10, 'rsi': rsi,
-        'adx': adx, 'vol_ratio': vol_ratio,
-        'close_closed': close_closed, 'sma_closed': sma_closed,
-        'adx_closed': adx_closed, 'rsi_closed': rsi_closed
+        't': k[0], 'o': float(k[1]), 'h': float(k[2]),
+        'l': float(k[3]), 'c': float(k[4]), 'v': float(k[5])
     }
 
-# ========== 信号判断 v4.3（5条件）==========
-def check_entry(data):
-    r5 = data['5m']; r4 = data['4h']; r1 = data['1h']; r4 = data['4h']; rd = data['1d']
-
-    price = r5['price']
-    rsi5m = r5.get('rsi_closed', r5['rsi'])  # 闭K RSI，与量比同源
-    adx1h = r1.get('adx_closed', r1['adx'])  # 闭K ADX
-    adx4h = r4.get('adx_closed', r4['adx'])  # 闭K ADX
-    vol_ratio = r5['vol_ratio']
-    sma5m = r5['sma_closed']  # 前10根闭K的SMA10（不含当前未闭K线）
-
-    # 条件①: 1h方向 (闭K收盘价 vs 闭K SMA10)
-    h1_close = r1.get('close_closed', r1['price'])
-    sma1h = r1.get('sma_closed', r1['sma10'])
-    h1_bull = h1_close > sma1h
-
-    # 条件②: 1h ADX > 20 (滤横盘)
-    if adx1h <= ADX_1H_MIN:
-        return None, f"观望 | 1hADX={adx1h:.1f}≤{ADX_1H_MIN}"
-
-    # 条件③: 4h ADX < 55 (防追末端过热)
-    if adx4h >= ADX_4H_MAX:
-        return None, f"观望 | 4hADX={adx4h:.1f}≥{ADX_4H_MAX}"
-
-    # 条件④: 回调范围 ±1.0%
-    deviation = abs(price / sma5m - 1) * 100
-    if deviation > RANGE_PCT:
-        return None, f"观望 | 偏离SMA10 ±{deviation:.1f}%"
-
-    # 条件⑤: 量比 ≥ 1.0x
-    if vol_ratio < VOL_RATIO_MIN:
-        return None, f"观望 | 缩量 vol={vol_ratio:.1f}x"
-
-    # 条件⑥: RSI门控（1h方向决定LONG/SHORT）
-    if h1_bull:
-        # 1h多头 → LONG
-        if rsi5m >= RSI_LONG_MIN:
-            return ('LONG', f"【LONG顺势追多】RSI={rsi5m:.1f} ADX1h={adx1h:.1f} vol={vol_ratio:.1f}x RSI闭K={rsi5m:.1f}")
-        else:
-            return None, f"观望 | RSI={rsi5m:.1f}<{RSI_LONG_MIN} 不触发LONG"
-    else:
-        # 1h空头 → SHORT
-        if rsi5m <= RSI_SHORT_MAX:
-            return ('SHORT', f"【SHORT顺势摸顶】RSI={rsi5m:.1f} ADX1h={adx1h:.1f} vol={vol_ratio:.1f}x RSI闭K={rsi5m:.1f}")
-        else:
-            return None, f"观望 | RSI={rsi5m:.1f}>{RSI_SHORT_MAX} 不触发SHORT"
-
-    return None, f"观望 | 1h{'多' if h1_bull else '空'} RSI={rsi5m:.1f} ADX1h={adx1h:.1f}"
-
-# ========== 仓位管理（双向共存+保护） ==========
-def manage_positions(state, price, signal, reason, sma5m, data=None):
-    closed = False
-
-    # ── LONG止盈止损 ──
-    lp = state.get('long_pos')
-    if lp:
-        pnl = (price - lp['entry']) / lp['entry']
-        if pnl <= -STOP_LOSS_PCT:
-            log(f"🛑 LONG止损 | ${lp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
-            if do_close('LONG', price, lp, '止损'):
-                state['long_pos'] = None
-                state['last_exit_time'] = time.time()
-                closed = True
-        elif pnl >= TAKE_PROFIT_PCT:
-            log(f"✅ LONG止盈 | ${lp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
-            if do_close('LONG', price, lp, '止盈'):
-                state['long_pos'] = None
-                state['last_exit_time'] = time.time()
-                closed = True
-
-    # ── SHORT止盈止损 ──
-    sp = state.get('short_pos')
-    if sp:
-        pnl = (sp['entry'] - price) / sp['entry']
-        if pnl <= -STOP_LOSS_PCT:
-            log(f"🛑 SHORT止损 | ${sp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
-            if do_close('SHORT', price, sp, '止损'):
-                state['short_pos'] = None
-                state['last_exit_time'] = time.time()
-                closed = True
-        elif pnl >= TAKE_PROFIT_PCT:
-            log(f"✅ SHORT止盈 | ${sp['entry']:.0f} → ${price:.0f} ({pnl*100:+.2f}%)")
-            if do_close('SHORT', price, sp, '止盈'):
-                state['short_pos'] = None
-                state['last_exit_time'] = time.time()
-                closed = True
-
-    # ── 冷却检查：等平仓那根5m K线闭合后才能开新仓 ──
-    last_exit = state.get('last_exit_time', 0)
-    if last_exit > 0:
-        exit_kline_close = ((int(last_exit) // 300) + 1) * 300
-        remaining = exit_kline_close - int(time.time())
-        if remaining > 0 and remaining <= COOLDOWN_SEC:
-            if signal:
-                log(f"⏳ 等K线闭合 {remaining}s | 跳过{signal}")
-            return closed
-        else:
-            # K线已闭合，清除冷却，允许开仓
-            state['last_exit_time'] = 0
-
-    # ── 新信号（双向共存，各方向独立管理）──
-    if signal == 'LONG':
-        # 开仓前二次验价：实时价距5m SMA10 ≤±1.0%
-        if abs(price / sma5m - 1) * 100 > RANGE_PCT:
-            log(f"🛡 开仓验价拦截 | 偏离SMA10 ±{abs(price/sma5m-1)*100:.1f}%")
-        else:
-            entry_price = do_open('LONG', price, reason, data)
-            if entry_price:
-                state['long_pos'] = {'entry': entry_price, 'signal': reason, 'open_time': datetime.now().isoformat()}
-    elif signal == 'SHORT':
-        if abs(price / sma5m - 1) * 100 > RANGE_PCT:
-            log(f"🛡 开仓验价拦截 | 偏离SMA10 ±{abs(price/sma5m-1)*100:.1f}%")
-        else:
-            entry_price = do_open('SHORT', price, reason, data)
-            if entry_price:
-                state['short_pos'] = {'entry': entry_price, 'signal': reason, 'open_time': datetime.now().isoformat()}
-
-    save_state(state)
-    return closed
-
-# ========== 开仓执行（交易所级单方向单仓保护） ==========
-def do_open(direction, price, reason, data=None):
-    try:
-        # ① 仓位安全锁：查现有持仓，同方向 ≥ QTY 则跳过信号
-        positions = trade_binance.fetch_positions()
-        for p in positions:
-            if p.get('symbol') != SYMBOL:
-                continue
-            existing_qty = float(p.get('contracts', 0))
-            if existing_qty <= 0:
-                continue
-            side = 'LONG' if p.get('side') == 'long' else 'SHORT'
-            if side == direction and existing_qty >= QTY:
-                log(f"🛡 仓位安全锁 | 已有{direction}仓{existing_qty}BTC≥{QTY}BTC | 跳过信号")
-                return False
-
-        # ② 同方向仓位保护：已有同向仓 ≥ QTY 则跳过（双向共存，不同向不阻塞）
-        current_state = load_state()
-        if direction == 'LONG' and current_state.get('long_pos') is not None:
-            log(f"🛡 同向仓位保护 | 已有LONG仓，跳过LONG信号")
-            return False
-        if direction == 'SHORT' and current_state.get('short_pos') is not None:
-            log(f"🛡 同向仓位保护 | 已有SHORT仓，跳过SHORT信号")
-            return False
-
-        # ③ 市价开仓
-        open_side = 'buy' if direction == 'LONG' else 'sell'
-        order = trade_binance.create_order(SYMBOL, 'market', open_side, QTY,
-                                     params={'positionSide': direction})
-        entry_price = order.get('average', price)
-
-        # 计算SL/TP价格
-        if direction == 'LONG':
-            sl_p = round(entry_price * (1 - STOP_LOSS_PCT), 1)
-            tp_p = round(entry_price * (1 + TAKE_PROFIT_PCT), 1)
-        else:
-            sl_p = round(entry_price * (1 + STOP_LOSS_PCT), 1)
-            tp_p = round(entry_price * (1 - TAKE_PROFIT_PCT), 1)
-
-        log(f"🚀 {direction}市价开仓 | {reason} | ${entry_price:.0f} | SL:{sl_p} TP:{tp_p}")
-
-        # 清除挂单标记，触发 ensure_sl_tp 重新挂单
-        state = load_state()
-        if isinstance(state.get('sl_tp_mounted'), dict):
-            state['sl_tp_mounted'].pop(direction, None)
-        save_state(state)
-
-        # ── 结构化交易日志 ──
-        r5 = data['5m'] if data else {}
-        r1 = data['1h'] if data else {}
-        rd = data['1d'] if data else {}
-        h1_close_val = r1.get('close_closed', r1.get('price', 0))
-        h1_sma_val = r1.get('sma_closed', r1.get('sma10', 0))
-        d_close = rd.get('close_closed', rd.get('price', 0))
-        d_sma = rd.get('sma_closed', rd.get('sma10', 0))
-        dir_1h = '多' if h1_close_val > h1_sma_val else '空'
-        dir_1d = '多' if d_close > d_sma else '空'
-
-        trade_csv = os.path.join(BASE_DIR, 'logs', 'trade_log.csv')
-        csv_row = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},{SYMBOL.split(':')[0].replace('/','')},{direction},{entry_price:.1f},{QTY},{sl_p},{tp_p},{reason},{dir_1h},{dir_1d},{r5.get('rsi',0):.1f},{r1.get('adx',0):.1f},{r4.get('adx',0):.1f},{r5.get('sma10',0):.0f},{r5.get('vol_ratio',0):.1f},{r5.get('price',0):.0f}"
-        with open(trade_csv, 'a') as f:
-            f.write(csv_row + '\n')
-
-        # 详细文本日志
-        detail = (f"{direction} | ${entry_price:.0f} | SL:{sl_p} TP:{tp_p}\n"
-                  f"  信号:{reason}\n"
-                  f"  指标: 1h{dir_1h} 1d{dir_1d} | 5mRSI={r5.get('rsi',0):.1f} 1hADX={r1.get('adx',0):.1f} "
-                  f"SMA10={r5.get('sma10',0):.0f} vol={r5.get('vol_ratio',0):.1f}x | 实时价={price:.0f}")
-        work_log("开仓", detail)
-
-        msg = (f"{'🟢' if direction=='LONG' else '🔴'} BTC开仓\n"
-               f"{direction} @ ${entry_price:,.0f}\n"
-               f"SL:{sl_p} TP:{tp_p}\n"
-               f"{reason}\n"
-               f"1h{dir_1h} 1d{dir_1d} | RSI={r5.get('rsi',0):.0f} ADX1h={r1.get('adx',0):.0f}")
-        notify_alert(msg)
-        return entry_price
-
-    except Exception as e:
-        log(f"❌ {direction}开仓失败: {e}")
-        work_log("错误", f"开仓失败: {e}")
+# ========== 核心逻辑 ==========
+def check_signal(kl_1h, kl_4h):
+    """
+    用闭K指标判断信号
+    偏移: EMA方向 lv-1 | ADX1h 闭K | ADX4h 前一完整4h闭K
+          RSI 闭K | 量比 lv-1
+    返回: 'long' / 'short' / None
+    """
+    n = len(kl_1h)
+    if n < 100:
         return None
 
-# ========== 平仓执行 ==========
-def do_close(direction, price, pos_data, reason):
+    closes = [k['c'] for k in kl_1h]
+    highs  = [k['h'] for k in kl_1h]
+    lows   = [k['l'] for k in kl_1h]
+    vols   = [k['v'] for k in kl_1h]
+
+    # 指标
+    ema5  = ema(closes, 5)
+    ema10 = ema(closes, 10)
+    rsi_v = rsi(closes, 14)
+    adx1  = adx(highs, lows, closes, 14)
+    vr    = vol_ratio(vols, 20)
+
+    # 4h ADX 映射
+    t_4h = [k['t'] for k in kl_4h]
+    c4h  = [k['c'] for k in kl_4h]
+    h4h  = [k['h'] for k in kl_4h]
+    l4h  = [k['l'] for k in kl_4h]
+    adx4 = adx(h4h, l4h, c4h, 14)
+
+    # 找1h之前最近一个已闭的4h K线
+    # searchsorted: 当前1h时间所属4h窗口的前一组4h
+    t_now_ms = int(time.time() * 1000)
+    # 用倒数第2根1h的时间来找4h (因为当前1h可能未闭)
+    t_signal = kl_1h[-2]['t']  # lv-1已闭K线时间
+
+    adx4_val = 0
+    for i in range(len(t_4h)-1, -1, -1):
+        if t_4h[i] + 4*3600*1000 <= t_signal:  # 找到signal时间之前已闭的4h
+            adx4_val = adx4[i] if i < len(adx4) else 0
+            break
+
+    # EMA方向: lv-1闭K (倒数第2根)
+    pi = n - 2  # 已闭K线索引
+    ema_dir_long  = ema5[pi] > ema10[pi]   # 已闭K中ema5在ema10上方
+    ema_dir_short = ema5[pi] < ema10[pi]   # 已闭K中ema5在ema10下方
+
+    # 量比: lv-1 (倒数第2根的vol)
+    vol_ok = vr[pi-1] if pi-1 > 0 else vr[pi]  # vol[i-1]/mean(vol[i-20...i-1]), i是闭K索引
+    # 注意: 你的公式是"vol[i-1] / mean(vol[i-20...i-1])"，也就是说量比也是lv-1偏移
+    # vr[pi] 是 vol[pi]/mean(vol[pi-19...pi])
+    # 按你的要求 vol[i-1]/mean(vol[i-20...i-1]) 对应的是 vr[pi-1]
+    # 但为了保守，根据你原策略代码直接来判断：使用lv-1闭K成交量
+
+    cond_1h_adx = adx1[pi] > ADX_1H_MIN
+    cond_4h_adx = adx4_val < ADX_4H_MAX
+    cond_vol    = vr[pi-1] > VOL_RATIO_MIN if pi-1 >= 0 else False  # lv-1偏移量比
+
+    sign = None
+    if ema_dir_long and cond_1h_adx and cond_4h_adx and rsi_v[pi] > RSI_LONG_MIN and cond_vol:
+        sign = 'long'
+    elif ema_dir_short and cond_1h_adx and cond_4h_adx and rsi_v[pi] < RSI_SHORT_MAX and cond_vol:
+        sign = 'short'
+
+    return sign
+
+def manage_positions(state):
+    """扫描持仓，实时价触发TP/SL平仓"""
     try:
-        close_side = 'sell' if direction == 'LONG' else 'buy'
-
-        # 查当前持仓数量
-        positions = trade_binance.fetch_positions()
-        qty = 0
-        for p in positions:
-            if float(p.get('contracts', 0)) > 0:
-                side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
-                if side_check == direction:
-                    qty = float(p['contracts'])
-                    break
-
-        if qty == 0:
-            log(f"⚠️ 未找到{direction}持仓，可能已被平")
-            return False
-
-        # ⚠️ 精度修复：整数币种ceil取整，小数币种保留原值
-        if QTY >= 1:
-            qty_ceil = math.ceil(qty)
-            if qty != qty_ceil:
-                log(f"🔧 平仓数量修正: {qty} → {qty_ceil}")
-                qty = qty_ceil
-
-        order = trade_binance.create_order(SYMBOL, 'market', close_side, qty,
-                                     params={'positionSide': direction})
-        close_price = order.get('average', price)
-
-        if direction == 'LONG':
-            pnl_pct = (close_price - pos_data['entry']) / pos_data['entry'] * 100
-        else:
-            pnl_pct = (pos_data['entry'] - close_price) / pos_data['entry'] * 100
-
-        log(f"✅ {direction}平仓 | ${close_price:.0f} | {pnl_pct:+.2f}% | {reason}")
-
-        msg = (f"{'🟢' if pnl_pct > 0 else '🔴'} BTC平仓\n"
-               f"{direction} {reason} | ${close_price:,.0f}\n"
-               f"盈亏: {pnl_pct:+.2f}%")
-        notify_alert(msg)
-        work_log(reason, f"{direction} | PnL:{pnl_pct:+.2f}%")
-
-        # 清理挂单
-        try:
-            raw_symbol = SYMBOL.split(':')[0]  # e.g. BTC/USDT
-            algo_symbol = raw_symbol.replace('/', '')  # BTCUSDT
-            algos = trade_binance.fapiprivate_get_openalgoorders({'symbol': algo_symbol})
-            for o in algos:
-                if o.get('algoStatus') == 'NEW' and o.get('positionSide') == direction:
-                    trade_binance.fapiPrivateDeleteAlgoOrder({'symbol': algo_symbol, 'algoId': int(o['algoId'])})
-        except:
-            pass
-
-        return True
-
-    except Exception as e:
-        log(f"❌ 平仓失败: {e}")
-        work_log("错误", f"平仓失败: {e}")
+        ticker = exchange.fetch_ticker(SYMBOL)
+        price = ticker['last']
+    except:
+        log("获取实时价失败")
         return False
 
-# ========== 挂止盈止损单 ==========
-def ensure_sl_tp(state):
-    """始终确保止盈止损挂单存在，缺失则补挂"""
-    mount_key = 'sl_tp_mounted'
-    if not isinstance(state.get(mount_key), dict):
-        state[mount_key] = {}
-    
-    for d_key, direction in [('long_pos', 'LONG'), ('short_pos', 'SHORT')]:
-        pos = state.get(d_key)
-        if not pos:
-            continue
-        
-        try:
-            positions = trade_binance.fetch_positions(symbols=[SYMBOL])
-        except:
-            log(f"⚠️ {direction}仓fetch_positions失败，跳过本次挂单检查")
-            continue
-        
-        qty = 0
+    now = time.time()
+    exit_kl = now // 3600  # 当前小时K线编号
+
+    # LONG平仓
+    surviving = []
+    for pos in state.get('longpos', []):
         entry = pos['entry']
-        for p in positions:
-            if p.get('symbol') != SYMBOL:
+        pnl = (price - entry) / entry
+        if pnl >= TP_PCT:
+            if close_position('LONG', pos, price, '止盈'):
+                state['lastexitkl_time'] = exit_kl
                 continue
-            if float(p.get('contracts', 0)) > 0:
-                side_check = 'LONG' if p.get('side') == 'long' else 'SHORT'
-                if side_check == direction:
-                    qty = float(p['contracts'])
-                    ep = float(p.get('entryPrice', 0))
-                    if ep > 0:
-                        entry = ep
-                    break
-        
-        if qty == 0:
-            log(f"⚠️ {direction}仓state有记录但交易所未找到持仓，跳过挂单 | 等待manage_positions清除")
-            continue
-        
-        if direction == 'LONG':
-            sl_p = round(entry * (1 - STOP_LOSS_PCT), 1)
-            tp_p = round(entry * (1 + TAKE_PROFIT_PCT), 1)
-            close_side = 'sell'
+        if pnl <= -SL_PCT:
+            if close_position('LONG', pos, price, '止损'):
+                state['lastexitkl_time'] = exit_kl
+                continue
+        surviving.append(pos)
+    state['longpos'] = surviving
+
+    # SHORT平仓
+    surviving = []
+    for pos in state.get('shortpos', []):
+        entry = pos['entry']
+        pnl = (entry - price) / entry
+        if pnl >= TP_PCT:
+            if close_position('SHORT', pos, price, '止盈'):
+                state['lastexitkl_time'] = exit_kl
+                continue
+        if pnl <= -SL_PCT:
+            if close_position('SHORT', pos, price, '止损'):
+                state['lastexitkl_time'] = exit_kl
+                continue
+        surviving.append(pos)
+    state['shortpos'] = surviving
+
+    return True
+
+def close_position(side, pos, price, reason):
+    """市价平仓"""
+    try:
+        # 强制减仓
+        exchange.create_order(
+            symbol=SYMBOL,
+            type='market',
+            side='sell',
+            amount=QTY,
+            params={'reduceOnly': True, 'positionSide': 'LONG' if side == 'LONG' else 'SHORT'}
+        )
+        entry = pos['entry']
+        pnl = (price-entry)/entry if side == 'LONG' else (entry-price)/entry
+        msg = f"BTC {side}平仓 {reason}: entry={entry:.2f} exit={price:.2f} PnL={pnl*100:+.2f}%"
+        log(msg)
+        work_log(reason, msg)
+        notify(msg)
+        return True
+    except Exception as e:
+        log(f"平仓失败: {e}")
+        return False
+
+def open_position(side, price):
+    """市价开仓"""
+    try:
+        ps = 'LONG' if side == 'LONG' else 'SHORT'
+        order = exchange.create_order(
+            symbol=SYMBOL,
+            type='market',
+            side='buy' if side == 'LONG' else 'sell',
+            amount=QTY,
+            params={'positionSide': ps}
+        )
+        fill_price = float(order.get('price', price) or price)
+        ts = datetime.now(timezone.utc).isoformat()
+
+        state = load_state()
+        new_pos = {
+            'entry': fill_price,
+            'signal': f'EMA5/10{"金叉" if side=="LONG" else "死叉"}',
+            'opentime': ts
+        }
+        if side == 'LONG':
+            state['longpos'].append(new_pos)
         else:
-            sl_p = round(entry * (1 + STOP_LOSS_PCT), 1)
-            tp_p = round(entry * (1 - TAKE_PROFIT_PCT), 1)
-            close_side = 'buy'
-        
-        # 查交易所现有挂单
-        symbol_raw = SYMBOL.split(':')[0].replace('/', '')
-        try:
-            all_orders = trade_binance.fapiprivate_get_openalgoorders({'symbol': symbol_raw})
-        except:
-            all_orders = []
-        
-        # 过滤：只匹配当前symbol + 当前方向的algo订单
-        own_orders = [o for o in all_orders
-                      if o.get('symbol') == symbol_raw
-                      and o.get('positionSide') == direction]
-        
-        # 找到现有的 SL/TP 挂单
-        existing_sl_orders = [o for o in own_orders if o.get('orderType') == 'STOP_MARKET']
-        existing_tp_orders = [o for o in own_orders if o.get('orderType') == 'TAKE_PROFIT_MARKET']
-        
-        # 检查SL价格是否匹配
-        sl_matched = any(abs(float(o.get('triggerPrice', 0)) - sl_p) < 0.01 for o in existing_sl_orders)
-        tp_matched = any(abs(float(o.get('triggerPrice', 0)) - tp_p) < 0.01 for o in existing_tp_orders)
-        
-        # 清理不匹配的旧挂单（价格变了）
-        for o in existing_sl_orders:
-            if abs(float(o.get('triggerPrice', 0)) - sl_p) >= 0.01:
-                try:
-                    trade_binance.fapiprivate_delete_algoorder({'symbol': symbol_raw, 'algoId': o['algoId']})
-                    log(f"  取消旧SL: ${o.get('triggerPrice')} (→ ${sl_p})")
-                except:
-                    pass
-        for o in existing_tp_orders:
-            if abs(float(o.get('triggerPrice', 0)) - tp_p) >= 0.01:
-                try:
-                    trade_binance.fapiprivate_delete_algoorder({'symbol': symbol_raw, 'algoId': o['algoId']})
-                    log(f"  取消旧TP: ${o.get('triggerPrice')} (→ ${tp_p})")
-                except:
-                    pass
-        
-        # 清理多余的同类型挂单（去重，只保留1条）
-        sl_remaining = existing_sl_orders[1:] if sl_matched else existing_sl_orders
-        tp_remaining = existing_tp_orders[1:] if tp_matched else existing_tp_orders
-        for o in sl_remaining + tp_remaining:
-            try:
-                trade_binance.fapiprivate_delete_algoorder({'symbol': symbol_raw, 'algoId': o['algoId']})
-            except:
-                pass
-        
-        if sl_matched and tp_matched and len(existing_sl_orders) <= 1 and len(existing_tp_orders) <= 1:
-            state[mount_key][direction] = True
-            save_state(state)
-            continue
-        
-        # 补挂缺失的
-        if not sl_matched or len(existing_sl_orders) == 0:
-            try:
-                trade_binance.create_order(SYMBOL, 'STOP_MARKET', close_side, qty,
-                    params={'stopPrice': sl_p, 'positionSide': direction})
-                log(f"  挂SL: ${sl_p}")
-            except Exception as e:
-                log(f"  SL挂单失败: {e}")
-        
-        if not tp_matched or len(existing_tp_orders) == 0:
-            try:
-                trade_binance.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', close_side, qty,
-                    params={'stopPrice': tp_p, 'positionSide': direction})
-                log(f"  挂TP: ${tp_p}")
-            except Exception as e:
-                log(f"  TP挂单失败: {e}")
-        
-        state[mount_key][direction] = True
+            state['shortpos'].append(new_pos)
+        state['lastentrykl_time'] = int(time.time() // 3600)
         save_state(state)
 
-
-def sync_state(state):
-    """
-    以交易所为准同步本地状态：
-    1. 交易所有仓但本地无记录 → 创建记录
-    2. 交易所有仓且本地有记录 → 修正入场价
-    3. 交易所无仓但本地有记录 → 只打warning，不主动清除（等止损触发清除）
-    """
-    try:
-        positions = trade_binance.fetch_positions()
-    except:
+        msg = f"BTC {side}开仓: entry={fill_price:.2f} qty={QTY}"
+        log(msg)
+        work_log('开仓', msg)
+        notify(msg)
+        return True
+    except Exception as e:
+        log(f"开仓失败: {e}")
+        work_log('开仓失败', str(e))
         return False
 
-    has_long = False
-    has_short = False
+def check_position_lock():
+    """交易所仓位保护: 同边≥3*QTY则拒绝"""
+    try:
+        pos = exchange.fetch_positions([SYMBOL])
+        for p in pos:
+            amt = abs(float(p.get('contracts', 0) or 0))
+            if p.get('side', '') == 'long' and amt >= MAX_POS * QTY:
+                return True
+            if p.get('side', '') == 'short' and amt >= MAX_POS * QTY:
+                return True
+    except:
+        pass
+    return False
 
-    for p in positions:
-        if p.get('symbol') != SYMBOL:
-            continue
-        qty = float(p.get('contracts', 0))
-        if qty <= 0:
-            continue
-        side = p.get('side', 'long')
-        exchange_entry = float(p.get('entryPrice', 0))
-        if side == 'long':
-            has_long = True
-            if state.get('long_pos') is None:
-                # 幽灵仓：交易所有但本地无 → 创建
-                state['long_pos'] = {
-                    'entry': exchange_entry,
-                    'signal': '从交易所恢复',
-                    'open_time': datetime.now().isoformat()
-                }
-                log(f"📌 恢复LONG仓 | {qty}BTC @ ${exchange_entry:.1f}")
-            elif exchange_entry > 0:
-                state['long_pos']['entry'] = exchange_entry
-        elif side == 'short':
-            has_short = True
-            if state.get('short_pos') is None:
-                state['short_pos'] = {
-                    'entry': exchange_entry,
-                    'signal': '从交易所恢复',
-                    'open_time': datetime.now().isoformat()
-                }
-                log(f"📌 恢复SHORT仓 | {qty}BTC @ ${exchange_entry:.1f}")
-            elif exchange_entry > 0:
-                state['short_pos']['entry'] = exchange_entry
-
-    # ⚠️ 交易所无仓但本地有记录 → 保留本地等止损触发清除
-    if not has_long and state.get('long_pos'):
-        log(f"⚠️ 交易所LONG已消失，本地保留等止损触发清除 | entry={state['long_pos']['entry']}")
-    if not has_short and state.get('short_pos'):
-        log(f"⚠️ 交易所SHORT已消失，本地保留等止损触发清除 | entry={state['short_pos']['entry']}")
-
-    # 不再主动 save_state（交给 manage_positions 统一保存）
-    return has_long or has_short
-
-# ========== 状态显示 ==========
-def print_status(data, state):
-    r5 = data['5m']; r4 = data['4h']; r1 = data['1h']
-    price = r5['price']; rsi = r5['rsi']; adx1h = r1['adx']; adx4h = r4['adx']
-    vol = r5['vol_ratio']
-
-    # 用闭K收盘价判断方向，与 check_entry 信号逻辑一致（只看1h）
-    h1_close_val = r1.get('close_closed', price)
-    h1_sma_val = r1.get('sma_closed', r1['sma10'])
-    dir_1h = '📈多' if h1_close_val > h1_sma_val else '📉空'
-
-    now = datetime.now().strftime('%H:%M:%S')
-    print(f"\n╔══ BTC v4.3趋势回调 {now} ═══")
-    print(f"║ 💰 {price:>10,.0f} | RSI:{rsi:.1f} | SMA10:{r5['sma10']:.0f}")
-    print(f"║ 1h{dir_1h} | ADX1h:{adx1h:.1f} ADX4h:{adx4h:.1f} | vol:{vol:.1f}x")
-
-    lp = state.get('long_pos')
-    sp = state.get('short_pos')
-    if lp:
-        pnl = (price - lp['entry']) / lp['entry'] * 100
-        print(f"║ 🟢 LONG ${lp['entry']:.0f} | {pnl:+.2f}% | 距TP:{TAKE_PROFIT_PCT*100-pnl:+.1f}%")
-    if sp:
-        pnl = (sp['entry'] - price) / sp['entry'] * 100
-        print(f"║ 🔴 SHORT ${sp['entry']:.0f} | {pnl:+.2f}% | 距TP:{TAKE_PROFIT_PCT*100-pnl:+.1f}%")
-    if not lp and not sp:
-        _, obs = check_entry(data)
-        print(f"║ ⚪ {obs[:60]}")
-
-    print(f"╚══════════════════════════╝")
+# ========== 设置杠杆 ==========
+def setup():
+    try:
+        exchange.set_leverage(LEVERAGE, SYMBOL)
+        exchange.set_margin_mode('isolated', SYMBOL)
+        log(f"杠杆 {LEVERAGE}x 逐仓 已设置")
+    except Exception as e:
+        log(f"杠杆设置: {e}")
 
 # ========== 主循环 ==========
 def main():
-    log(f"🚀 BTC v4.3 趋势回调 启动 | {LEVERAGE}x逐仓 | {QTY}BTC/仓")
-    log(f"策略: 6条件 TP{TAKE_PROFIT_PCT*100}%/SL{STOP_LOSS_PCT*100}% 双向共存")
+    log("="*50)
+    log("BTC v4.0 EMA5/10策略启动")
+    log(f"QTY={QTY} | LEV={LEVERAGE}x | TP={TP_PCT*100}% | SL={SL_PCT*100}%")
+    log(f"ADX1h>{ADX_1H_MIN} | ADX4h<{ADX_4H_MAX} | RSI_LONG>{RSI_LONG_MIN} | RSI_SHORT<{RSI_SHORT_MAX}")
+    log(f"量比>{VOL_RATIO_MIN}x | 仓位: {MAX_POS}仓/边")
+    log("="*50)
+    notify("BTC v4.0 EMA5/10策略已启动")
 
-    # 设置杠杆 + 逐仓模式
-    try:
-        trade_binance.set_leverage(LEVERAGE, SYMBOL)
-        trade_binance.set_margin_mode('isolated', SYMBOL)
-        log(f"杠杆设置: {LEVERAGE}x | 逐仓模式")
-    except Exception as e:
-        log(f"杠杆/保证金设置: {e}")
-
-    state = load_state()
-    if 'long_pos' not in state: state['long_pos'] = None
-    if 'short_pos' not in state: state['short_pos'] = None
-    if 'last_exit_time' not in state: state['last_exit_time'] = 0
-
-    sync_state(state)
-    log("📊 API Key已配置 | 合约K线分析+合约执行")
+    setup()
 
     while True:
+        start = time.time()
+
         try:
-            k5m, k1h, k4h, k1d = get_data()
-            if not k5m:
-                time.sleep(POLL_INTERVAL)
+            # 暂停检查
+            if os.path.exists(PAUSE_FILE):
+                time.sleep(5)
                 continue
 
-            df5m = pd.DataFrame(k5m, columns=['t','o','h','l','c','v'])
-            df1h = pd.DataFrame(k1h, columns=['t','o','h','l','c','v'])
-            df4h = pd.DataFrame(k4h, columns=['t','o','h','l','c','v'])
-            df1d = pd.DataFrame(k1d, columns=['t','o','h','l','c','v'])
+            # 获取数据
+            kl_1h = [extract(k) for k in fetch_klines('1h', 200)]
+            kl_4h = [extract(k) for k in fetch_klines('4h', 200)]
 
-            data = {
-                '5m': calc(df5m),
-                '1h': calc(df1h),
-                '4h': calc(df4h),
-                '1d': calc(df1d)
-            }
+            if len(kl_1h) < 100 or len(kl_4h) < 50:
+                log(f"数据不足: 1h={len(kl_1h)} 4h={len(kl_4h)}")
+                time.sleep(10)
+                continue
 
+            # 加载状态
             state = load_state()
-            if 'long_pos' not in state: state['long_pos'] = None
-            if 'short_pos' not in state: state['short_pos'] = None
-            if 'last_exit_time' not in state: state['last_exit_time'] = 0
+            if 'lastexitkl_time' not in state:
+                state['lastexitkl_time'] = 0
+            if 'lastentrykl_time' not in state:
+                state['lastentrykl_time'] = 0
+            if 'longpos' not in state:
+                state['longpos'] = []
+            if 'shortpos' not in state:
+                state['shortpos'] = []
 
-            price = data['5m']['price']
-            sig, reason = check_entry(data)
+            # 平仓管理 (实时价)
+            manage_positions(state)
+            save_state(state)
 
-            # 先查交易所实际持仓做交叉验证，防止本地状态过期
-            sync_state(state)
+            # 仓位锁
+            if check_position_lock():
+                time.sleep(1)
+                continue
 
-            manage_positions(state, price, sig, reason, data['5m']['sma10'], data)
+            # 冷却: 同K线刚平仓不重开
+            now_kl = int(time.time() // 3600)
+            # 同K线平仓后冷却
+            if state['lastexitkl_time'] == now_kl:
+                time.sleep(1)
+                continue
+            # 同K线仅允许开一次
+            if state['lastentrykl_time'] == now_kl:
+                time.sleep(1)
+                continue
 
-            # 重新加载 state（manage_positions 内部已 save）
-            state = load_state()
-            if 'long_pos' not in state: state['long_pos'] = None
-            if 'short_pos' not in state: state['short_pos'] = None
-            if 'last_exit_time' not in state: state['last_exit_time'] = 0
+            # 信号判断
+            signal = check_signal(kl_1h, kl_4h)
 
-            has_pos = bool(state.get('long_pos') or state.get('short_pos'))
-            if has_pos:
-                ensure_sl_tp(state)
+            if signal == 'long' and len(state['longpos']) < MAX_POS:
+                ticker = exchange.fetch_ticker(SYMBOL)
+                price = ticker['last']
+                open_position('LONG', price)
 
-            print_status(data, state)
-            time.sleep(POLL_INTERVAL)
+            elif signal == 'short' and len(state['shortpos']) < MAX_POS:
+                ticker = exchange.fetch_ticker(SYMBOL)
+                price = ticker['last']
+                open_position('SHORT', price)
 
-        except KeyboardInterrupt:
-            log("🛑 停止")
-            break
         except Exception as e:
-            log(f"❌ {e}")
-            import traceback; traceback.print_exc()
-            time.sleep(POLL_INTERVAL)
+            log(f"循环异常: {e}")
+            work_log('异常', str(e))
 
-if __name__ == "__main__":
+        # 每秒扫描
+        elapsed = time.time() - start
+        if elapsed < 1:
+            time.sleep(1 - elapsed)
+
+if __name__ == '__main__':
     main()

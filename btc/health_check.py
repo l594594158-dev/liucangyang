@@ -68,28 +68,29 @@ def get_exchange_positions(sym):
 def clean_orphan_orders(sym, has_long, has_short):
     """
     清理幽灵挂单: 挂单的 positionSide 在交易所没有对应持仓 → 撤销
-    Binance: direction=SELL+positionSide=LONG=平多, direction=BUY+positionSide=SHORT=平空
+    走 fapi/v1/allOrders 拉取全部 NEW 状态订单 (包含STOP_MARKET/TAKE_PROFIT_MARKET)
     """
     try:
-        orders = exchange.fetch_open_orders(sym)
+        # 查全部订单，筛选NEW状态的(STOP_MARKET/TAKE_PROFIT_MARKET/LIMIT等)
+        raw = exchange.fapiPrivateGetAllOrders(params={'symbol': sym.replace('/USDT:USDT', 'USDT'), 'limit': 50})
         cancelled = 0
-        for o in orders:
-            info = o.get('info', {})
-            ps = info.get('positionSide', '')
-            amt = float(info.get('origQty', 0) or 0)
+        for o in (raw if isinstance(raw, list) else []):
+            if o.get('status') != 'NEW':
+                continue
+            ps = o.get('positionSide', '')
+            amt = float(o.get('origQty', 0) or 0)
             if amt == 0:
                 continue
-            
-            # 判断此挂单对应的持仓方向
+            # 挂单对应positionSide，检查交易所是否有对应持仓
             if ps == 'LONG' and not has_long:
                 try:
-                    exchange.cancel_order(o['id'], sym)
+                    exchange.cancel_order(o['orderId'], sym)
                     cancelled += 1
                 except:
                     pass
             elif ps == 'SHORT' and not has_short:
                 try:
-                    exchange.cancel_order(o['id'], sym)
+                    exchange.cancel_order(o['orderId'], sym)
                     cancelled += 1
                 except:
                     pass

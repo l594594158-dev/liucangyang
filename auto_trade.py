@@ -361,33 +361,29 @@ def _place_sl_tp(side, entry, pid):
             tp_price = round(entry * (1 + TP_PCT), 2)
             # SL
             exchange.create_order(
-                symbol=SYMBOL, type='limit', side='sell', amount=QTY,
-                price=sl_price,
-                params={'reduceOnly': True, 'positionSide': 'LONG',
-                        'stopPrice': sl_price, 'timeInForce': 'GTC'}
+                symbol=SYMBOL, type='STOP_MARKET', side='sell', amount=QTY,
+                params={'stopPrice': sl_price, 'positionSide': 'LONG',
+                        'workingType': 'MARK_PRICE'}
             )
             # TP
             exchange.create_order(
-                symbol=SYMBOL, type='limit', side='sell', amount=QTY,
-                price=tp_price,
-                params={'reduceOnly': True, 'positionSide': 'LONG',
-                        'stopPrice': tp_price, 'timeInForce': 'GTC'}
+                symbol=SYMBOL, type='TAKE_PROFIT_MARKET', side='sell', amount=QTY,
+                params={'stopPrice': tp_price, 'positionSide': 'LONG',
+                        'workingType': 'MARK_PRICE'}
             )
             log(f"  SL={sl_price} TP={tp_price} (PID={pid})")
         else:
             sl_price = round(entry * (1 + SL_PCT), 2)
             tp_price = round(entry * (1 - TP_PCT), 2)
             exchange.create_order(
-                symbol=SYMBOL, type='limit', side='buy', amount=QTY,
-                price=sl_price,
-                params={'reduceOnly': True, 'positionSide': 'SHORT',
-                        'stopPrice': sl_price, 'timeInForce': 'GTC'}
+                symbol=SYMBOL, type='STOP_MARKET', side='buy', amount=QTY,
+                params={'stopPrice': sl_price, 'positionSide': 'SHORT',
+                        'workingType': 'MARK_PRICE'}
             )
             exchange.create_order(
-                symbol=SYMBOL, type='limit', side='buy', amount=QTY,
-                price=tp_price,
-                params={'reduceOnly': True, 'positionSide': 'SHORT',
-                        'stopPrice': tp_price, 'timeInForce': 'GTC'}
+                symbol=SYMBOL, type='TAKE_PROFIT_MARKET', side='buy', amount=QTY,
+                params={'stopPrice': tp_price, 'positionSide': 'SHORT',
+                        'workingType': 'MARK_PRICE'}
             )
             log(f"  SL={sl_price} TP={tp_price} (PID={pid})")
     except Exception as e:
@@ -491,13 +487,17 @@ def main():
                 open_position('SHORT', price)
 
         except Exception as e:
+            if not globals().get("_last_err_ts", 0) or time.time() - globals()["_last_err_ts"] > 30:
+                globals()["_last_err_ts"] = time.time()
+                time.sleep(10)
+                continue
             log(f"循环异常: {e}")
             work_log('异常', str(e))
 
         # 每秒扫描
         elapsed = time.time() - start
-        if elapsed < 1:
-            time.sleep(1 - elapsed)
+        if elapsed < 30:
+            time.sleep(30 - elapsed)
 
 if __name__ == '__main__':
     main()

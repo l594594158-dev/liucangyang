@@ -37,6 +37,7 @@ BASE_DIR = '/root/liucangyang/zec'
 STATE_FILE = f'{BASE_DIR}/databases/state_zec.json'
 PAUSE_FILE = f'{BASE_DIR}/databases/zec_pause.flag'
 NOTIFY_QUEUE = f'{BASE_DIR}/databases/notify_queue.json'
+POSITION_LOG = f'{BASE_DIR}/logs/position_log.csv'
 WORK_LOG = f'{BASE_DIR}/logs/zec_work_log.txt'
 
 # ========== 策略参数 ==========
@@ -285,6 +286,21 @@ def _cancel_all_orders():
     except:
         pass
 
+def _log_position(side, entry, signal):
+    """写入开仓日志到CSV"""
+    try:
+        from datetime import datetime
+        import csv, os
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        exists = os.path.exists(POSITION_LOG)
+        with open(POSITION_LOG, 'a', newline='') as f:
+            w = csv.writer(f)
+            if not exists:
+                w.writerow(['timestamp','strategy','side','signal','entry_price','qty','leverage'])
+            w.writerow([ts, SYMBOL, side, signal, entry, QTY, LEVERAGE])
+    except:
+        pass
+
 def _place_sl_tp(side, entry, pid):
     """开仓后挂SL/TP条件委托 (STOP_MARKET/TAKE_PROFIT_MARKET)"""
     try:
@@ -349,6 +365,9 @@ def open_position(side, price, state):
 
         # 挂SL/TP条件单
         _place_sl_tp(side, fill_price, pid)
+
+        # 写入开仓日志
+        _log_position(side, fill_price, new_pos.get('signal',''))
 
         msg = f"ZEC {side}开仓: entry={fill_price:.4f} qty={QTY}"
         log(msg)

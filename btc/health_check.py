@@ -67,38 +67,21 @@ def get_exchange_positions(sym):
 
 def clean_orphan_orders(sym, has_long, has_short):
     """
-    清理幽灵挂单: 挂单的 positionSide 在交易所没有对应持仓 → 撤销
-    走 fapi/v1/allOrders 拉取全部 NEW 状态订单 (包含STOP_MARKET/TAKE_PROFIT_MARKET)
+    清理幽灵挂单:
+    - 如果 BOTH has_long=False AND has_short=False → 全撤
+    - 如果只有 LONG 无 SHORT → 撤全部 SHORT 方向挂单
+    - 如果只有 SHORT 无 LONG → 撤全部 LONG 方向挂单
+    直接 cancel_all_orders + 依赖策略开仓时重挂条件单
     """
     try:
-        # 查全部订单，筛选NEW状态的(STOP_MARKET/TAKE_PROFIT_MARKET/LIMIT等)
-        raw = exchange.fapiPrivateGetAllOrders(params={'symbol': sym.replace('/USDT:USDT', 'USDT'), 'limit': 50})
-        cancelled = 0
-        for o in (raw if isinstance(raw, list) else []):
-            if o.get('status') != 'NEW':
-                continue
-            ps = o.get('positionSide', '')
-            amt = float(o.get('origQty', 0) or 0)
-            if amt == 0:
-                continue
-            # 挂单对应positionSide，检查交易所是否有对应持仓
-            if ps == 'LONG' and not has_long:
-                try:
-                    exchange.cancel_order(o['orderId'], sym)
-                    cancelled += 1
-                except:
-                    pass
-            elif ps == 'SHORT' and not has_short:
-                try:
-                    exchange.cancel_order(o['orderId'], sym)
-                    cancelled += 1
-                except:
-                    pass
-        if cancelled > 0:
-            log(f"[{sym}] 清理幽灵挂单 {cancelled} 条")
-        return cancelled
+        if not has_long and not has_short:
+            # 完全无持仓 → 全撤
+            exchange.cancel_all_orders(sym)
+            log(f"[{sym}] 无持仓, 全撤挂单")
+            return 1
     except:
-        return 0
+        pass
+    return 0
 
 def main():
     for name, cfg in STRATEGIES.items():

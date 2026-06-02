@@ -348,6 +348,9 @@ def open_position(side, price):
         # 挂SL/TP条件单
         _place_sl_tp(side, fill_price, pid)
 
+        # 写入开仓日志
+        _log_position(side, fill_price, new_pos.get('signal',''))
+
         return True
     except Exception as e:
         log(f"开仓失败: {e}")

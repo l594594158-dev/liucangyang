@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-仓位同步策略 v1.3 — Gate.io 监控账户 → Gate.io 交易账户
+仓位同步策略 v1.4 — Gate.io 监控账户 → Gate.io 交易账户（按名义面值计算）
 - 每秒扫描监控账户持仓（Gate info.size 精确判仓）
 - 开仓同步：同向开仓，数量 = 监控仓位 × 40%
 - 平仓同步：监控平仓 → 交易账户立即 reduce_only 平仓
@@ -69,7 +69,7 @@ def save_state(state):
 
 
 def get_positions(exchange):
-    """返回 {symbol: {side, size, entryPrice}}，size=0 的跳过"""
+    """返回 {symbol: {side, size, entryPrice, markPrice}}，size=0 的跳过"""
     raw = exchange.fetch_positions()
     result = {}
     for p in raw:
@@ -85,35 +85,59 @@ def get_positions(exchange):
             'side': side,
             'size': abs(size),
             'entryPrice': float(info.get('entry_price', 0)),
+            'markPrice': float(info.get('mark_price', 0)),
         }
     return result
 
 
-# ---- Gate 合约最小下单量（张数） ----
-MIN_AMOUNTS = {
-    'BTC/USDT:USDT': 1,
-    'ETH/USDT:USDT': 1,
-    'SUI/USDT:USDT': 1,
-    'XLM/USDT:USDT': 1,
-    'ZEC/USDT:USDT': 1,
-    'NEAR/USDT:USDT': 1,
-    'HYPE/USDT:USDT': 1,
-    'LAB/USDT:USDT': 1,
-}
+# ---- Gate 合约最小下单量缓存 ----
+MIN_AMOUNTS = {}
+CONTRACT_SIZE_CACHE = {}
 
 
 def get_min_amount(exchange, symbol):
-    """从交易所获取最小下单量，失败时用本地缓存"""
     if symbol in MIN_AMOUNTS:
         return MIN_AMOUNTS[symbol]
     try:
         market = exchange.market(symbol)
         amt = market['limits']['amount']['min']
-        amt = max(amt, 1)  # 至少 1 张
+        amt = max(amt, 1)
         MIN_AMOUNTS[symbol] = amt
         return amt
     except:
         return 1
+
+
+def get_contract_size(exchange, symbol):
+    """获取每张合约代表的基础币数量"""
+    if symbol in CONTRACT_SIZE_CACHE:
+        return CONTRACT_SIZE_CACHE[symbol]
+    try:
+        market = exchange.market(symbol)
+        cs = market['contractSize']
+        CONTRACT_SIZE_CACHE[symbol] = cs
+        return cs
+    except:
+        return 1
+
+
+def calc_notional(exchange, positions):
+    """
+    计算每个仓位的名义面值(USDT)
+    positions = {symbol: {side, size, entryPrice}}
+    返回 {symbol: notional_usdt} 和 total
+    """
+    notionals = {}
+    total = 0
+    for symbol, pos in positions.items():
+        contract_size = get_contract_size(exchange, symbol)
+        mark_price = pos.get('markPrice', pos['entryPrice'])
+        if mark_price <= 0:
+            mark_price = pos['entryPrice']
+        notional = pos['size'] * contract_size * mark_price
+        notionals[symbol] = notional
+        total += notional
+    return notionals, total
 
 
 def market_open(exchange, symbol, side, qty):
@@ -155,29 +179,46 @@ def sync_round(monitor, trader, prev_state):
         time.sleep(0.3)
         trader_positions = get_positions(trader)
 
-    # 3. 开仓：监控有但交易没有的 → 40%
-    for symbol, mpos in monitor_positions.items():
-        tpos = trader_positions.get(symbol)
-        if tpos is not None:
-            continue  # 已有仓位，跳过
+    # 3. 开仓：监控有但交易没有的 → 按名义面值 40% 换算张数
+    if monitor_positions:
+        notionals, total_notional = calc_notional(monitor, monitor_positions)
+        trader_total_notional = total_notional * SYNC_RATIO
 
-        raw_qty = mpos['size'] * SYNC_RATIO
-        min_amt = get_min_amount(trader, symbol)
+        for symbol, mpos in monitor_positions.items():
+            tpos = trader_positions.get(symbol)
+            if tpos is not None:
+                continue  # 已有仓位，跳过
 
-        # BugFix: 40% 后不足最小下单量则跳过
-        if raw_qty < min_amt:
-            log(f"⏭️ [跳过] {symbol} {mpos['side']} 40%={raw_qty}张 < 最小{min_amt}张")
-            continue
+            # 该品种在监控账户的名义面值
+            monitor_notional = notionals[symbol]
+            # 按面值比例分配: 交易账户总面值 × (该品种面值占比)
+            target_notional = trader_total_notional * (monitor_notional / total_notional)
+            # 换算为张数
+            contract_size = get_contract_size(trader, symbol)
+            mark_price = mpos.get('markPrice', mpos['entryPrice'])
+            if mark_price <= 0:
+                mark_price = mpos['entryPrice']
+            raw_qty = target_notional / (contract_size * mark_price)
 
-        sync_qty = math.floor(raw_qty)  # BugFix: 取整到整数张
-        log(f"🔔 [开仓同步] {symbol} {mpos['side']} 监控={mpos['size']}张 → 同步={sync_qty}张")
+            min_amt = get_min_amount(trader, symbol)
+            sync_qty = math.floor(raw_qty)
 
-        try:
-            order = market_open(trader, symbol, mpos['side'], sync_qty)
-            log(f"✅ [同步开仓] {symbol} {mpos['side']} {sync_qty}张 id={order.get('id','N/A')}")
-            changed = True
-        except Exception as e:
-            log(f"❌ [同步开仓失败] {symbol} {mpos['side']} {sync_qty}张: {e}")
+            if sync_qty < min_amt:
+                log(f"⏭️ [跳过] {symbol} {mpos['side']} "
+                    f"名义面值={monitor_notional:.2f}U → 40%面值={target_notional:.2f}U "
+                    f"→ {raw_qty:.2f}张 < 最小{min_amt}张")
+                continue
+
+            log(f"🔔 [开仓同步] {symbol} {mpos['side']} "
+                f"面值={monitor_notional:.2f}U({mpos['size']}张) "
+                f"→ 40%面值={target_notional:.2f}U → {sync_qty}张")
+
+            try:
+                order = market_open(trader, symbol, mpos['side'], sync_qty)
+                log(f"✅ [同步开仓] {symbol} {mpos['side']} {sync_qty}张 id={order.get('id','N/A')}")
+                changed = True
+            except Exception as e:
+                log(f"❌ [同步开仓失败] {symbol} {mpos['side']} {sync_qty}张: {e}")
 
     # 4. 一致性检查：交易账户仓位方向是否与监控一致 (BugFix)
     if not changed:
@@ -228,7 +269,7 @@ def sync_round(monitor, trader, prev_state):
 
 
 def main():
-    log_mark("Gate 仓位同步策略 v1.3 启动")
+    log_mark("Gate 仓位同步策略 v1.4 启动")
     log(f"监控 Key: {MONITOR_CONFIG['apiKey'][:8]}...")
     log(f"交易 Key: {TRADER_CONFIG['apiKey'][:8]}...")
     log(f"同步比例: {SYNC_RATIO*100:.0f}% 扫描: {SCAN_INTERVAL}s")
